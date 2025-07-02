@@ -2,10 +2,17 @@ import discord
 from discord.ext import commands
 import asyncio
 import yt_dlp
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # betölti a .env fájlt
+
+token = os.getenv("DISCORD_TOKEN")
+
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='/zene ', intents=intents)
 
 # Queue kezelése
 song_queue = {}
@@ -29,7 +36,7 @@ async def join(ctx):
             await channel.connect()
         else:
             await ctx.voice_client.move_to(channel)
-        await ctx.send(f"🔊 Csatlakoztam: {channel.name}")
+        await ctx.send(f"🔊 Szevasz mindenki a {channel.name} szobában! Megjöttem kutyák!")
     else:
         await ctx.send("Előbb csatlakozz egy hangcsatornához!")
 
@@ -38,7 +45,7 @@ async def join(ctx):
 async def leave(ctx):
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
-        await ctx.send("👋 Kiléptem.")
+        await ctx.send("👋 Kiléptem a picsába innen.")
     else:
         await ctx.send("Nem vagyok voice csatornában.")
 
@@ -55,8 +62,9 @@ async def play(ctx, *, query):
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
-        'default_search': 'ytsearch',
-        'extract_flat': False, 
+        'noplaylist': True,
+        'extract_flat': False,
+        'skip_download': True,
     }
 
     await ctx.send(f"🔍 Keresés: {query}")
@@ -64,17 +72,20 @@ async def play(ctx, *, query):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(query, download=False)
 
-    entries = []
-    if 'entries' in info:  # Playlist
-        entries = info['entries']
-    else:  # Egyetlen videó
-        entries = [info]
+    entries = info.get('entries', [info])
 
     added_titles = []
     for entry in entries:
-        url = entry['url']
+        formats = entry.get('formats', [])
+        audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+        if audio_formats:
+            audio_formats.sort(key=lambda x: x.get('abr') or 0, reverse=True)
+            audio_url = audio_formats[0]['url']
+        else:
+            audio_url = entry.get('url')
+
         title = entry.get('title', 'Ismeretlen')
-        await queue.put((url, title, ctx))
+        await queue.put((audio_url, title, ctx))
         added_titles.append(title)
 
     if len(added_titles) == 1:
@@ -88,6 +99,7 @@ async def play(ctx, *, query):
 
     if not vc.is_playing():
         await play_next(ctx.guild)
+
 
 async def play_next(guild):
     vc = guild.voice_client
@@ -144,4 +156,4 @@ async def np(ctx):
     else:
         await ctx.send("Nem játszik semmi.")
 
-bot.run("IDE_JÖN_A_DISCORD_BOT_TOKEN")
+bot.run(token)
