@@ -50,6 +50,17 @@ async def leave(ctx):
         await ctx.send("Nem vagyok voice csatornában.")
 
 # Lejátszás vagy queue-ba rakás
+import re
+
+def is_url(text):
+    regex = re.compile(
+        r'^(?:http|ftp)s?://'  # http:// vagy https://
+        r'|^(?:www\.)',        # vagy www. - vel kezdődő
+        re.IGNORECASE
+    )
+    return re.match(regex, text) is not None
+
+
 @bot.command()
 async def play(ctx, *, query):
     vc = ctx.voice_client
@@ -67,10 +78,15 @@ async def play(ctx, *, query):
         'skip_download': True,
     }
 
+    # Ha nem URL, akkor ytsearch: prefix
+    search_term = query
+    if not is_url(query):
+        search_term = f"ytsearch:{query}"
+
     await ctx.send(f"🔍 Keresés: {query}")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=False)
+        info = ydl.extract_info(search_term, download=False)
 
     entries = info.get('entries', [info])
 
@@ -99,6 +115,7 @@ async def play(ctx, *, query):
 
     if not vc.is_playing():
         await play_next(ctx.guild)
+
 
 
 async def play_next(guild):
