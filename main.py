@@ -32,13 +32,19 @@ async def on_ready():
 async def join(ctx):
     if ctx.author.voice:
         channel = ctx.author.voice.channel
-        if ctx.voice_client is None:
-            await channel.connect()
-        else:
-            await ctx.voice_client.move_to(channel)
-        await ctx.send(f"🔊 Szevasz mindenki a {channel.name} szobában! Megjöttem kutyák!")
+        try:
+            if ctx.voice_client is None:
+                await channel.connect(timeout=10)  # max 10 mp várakozás
+            else:
+                await ctx.voice_client.move_to(channel)
+            await ctx.send(f"🔊 Szevasz mindenki a {channel.name} szobában! Megjöttem kutyák!")
+        except asyncio.TimeoutError:
+            await ctx.send("⚠️ Nem sikerült csatlakozni a voice csatornához: timeout.")
+        except Exception as e:
+            await ctx.send(f"⚠️ Hiba történt a csatlakozás során: {e}")
     else:
         await ctx.send("Előbb csatlakozz egy hangcsatornához!")
+
 
 # Kilépés voice csatornából
 @bot.command()
