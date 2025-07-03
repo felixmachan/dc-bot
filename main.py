@@ -8,11 +8,12 @@ from dotenv import load_dotenv
 load_dotenv()  # betölti a .env fájlt
 
 token = os.getenv("DISCORD_TOKEN")
+prefix = os.getenv("DISCORD_PREFIX", "/zene ")
 
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='/zene ', intents=intents)
+bot = commands.Bot(command_prefix=prefix, intents=intents)
 
 # Queue kezelése
 song_queue = {}
