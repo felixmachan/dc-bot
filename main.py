@@ -5,7 +5,7 @@ import yt_dlp
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  # betölti a .env fájlt
+load_dotenv() 
 
 token = os.getenv("DISCORD_TOKEN")
 prefix = os.getenv("DISCORD_PREFIX", "/zene ")
@@ -15,7 +15,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=prefix, intents=intents)
 
-# Queue kezelése
+# Queue handling
 song_queue = {}
 now_playing = {}
 
@@ -28,7 +28,7 @@ def get_guild_queue(guild_id):
 async def on_ready():
     print(f'✅ Bot elindult: {bot.user}')
 
-# Csatlakozás voice csatornához
+# Joining voice channel
 @bot.command()
 async def join(ctx):
     if ctx.author.voice:
@@ -47,7 +47,7 @@ async def join(ctx):
         await ctx.send("Előbb csatlakozz egy hangcsatornához!")
 
 
-# Kilépés voice csatornából
+# Leave voice channel
 @bot.command()
 async def leave(ctx):
     if ctx.voice_client:
@@ -56,7 +56,7 @@ async def leave(ctx):
     else:
         await ctx.send("Nem vagyok voice csatornában.")
 
-# Lejátszás vagy queue-ba rakás
+# Play or add to queue
 import re
 
 def is_url(text):
@@ -85,7 +85,7 @@ async def play(ctx, *, query):
         'skip_download': True,
     }
 
-    # Ha nem URL, akkor ytsearch: prefix
+# If query is not a URL
     search_term = query
     if not is_url(query):
         search_term = f"ytsearch:{query}"
@@ -126,7 +126,7 @@ async def play(ctx, *, query):
         await play_next(ctx.guild)
 
 
-
+# Next song in queue
 async def play_next(guild):
     vc = guild.voice_client
     if not vc or not vc.is_connected():
@@ -159,6 +159,7 @@ async def play_next(guild):
     vc.play(source, after=after)
     await ctx.send(f"🎧 Most játszom: **{title}**")
 
+# Skip current song
 @bot.command()
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
@@ -167,6 +168,7 @@ async def skip(ctx):
     else:
         await ctx.send("Nem játszik semmi.")
 
+# Pause current song
 @bot.command()
 async def pause(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
@@ -175,6 +177,7 @@ async def pause(ctx):
     else:
         await ctx.send("Nem játszik semmi.")
 
+# Resume current song
 @bot.command()
 async def resume(ctx):
     if ctx.voice_client and ctx.voice_client.is_paused():
@@ -183,6 +186,7 @@ async def resume(ctx):
     else:
         await ctx.send("Nem volt szüneteltetve.")
 
+# Show current song
 @bot.command()
 async def np(ctx):
     title = now_playing.get(ctx.guild.id, None)

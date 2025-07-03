@@ -3,8 +3,6 @@
 A simple yet functional Discord music bot built with Python, [discord.py](https://discordpy.readthedocs.io/), and [yt-dlp](https://github.com/yt-dlp/yt-dlp).  
 Supports YouTube streaming with a queue, pause/resume, skip, and current playing info.
 
----
-
 ## ⚙️ Features
 
 - ✅ Join and leave voice channels
@@ -14,8 +12,6 @@ Supports YouTube streaming with a queue, pause/resume, skip, and current playing
 - ⏸️ Pause / ▶️ Resume / ⏭️ Skip songs
 - 📝 Display the currently playing track
 
----
-
 ## 📦 Requirements
 
 - Python 3.9+
@@ -23,11 +19,9 @@ Supports YouTube streaming with a queue, pause/resume, skip, and current playing
 - Recommended: Virtual environment
 - A server if you want to host it 24/7
 
----
-
 ## 🧪 Setup
 
-0. **Install required packages**
+### 0. **Install required packages**
 
 - Linux:
 
@@ -41,44 +35,42 @@ sudo apt install -y python3 python3-pip ffmpeg
   - [FFMPEG](https://github.com/BtbN/FFmpeg-Builds/releases)
   - Add `C:\Program Files\ffmpeg\bin` to your PATH
 
-1. **Clone the repository**
+### 1. **Clone the repository**
 
-   ```bash
-   git clone https://github.com/yourname/discord-music-bot.git
-   cd discord-music-bot
-   ```
+```bash
+git clone https://github.com/yourname/discord-music-bot.git
+cd discord-music-bot
+```
 
-2. **Create and activate a virtual environment**
+### 2. **Create and activate a virtual environment**
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 ```
 
-3. **Install dependencies**
+### 3. **Install dependencies**
 
 ```bash
 pip install -r requirements.txt
 ```
 
-4. **Create a .env file** with your Discord bot token or rename the `.env.example`:
+### 4. **Create a .env file** with your Discord bot token or rename the `.env.example`:
 
 You can set your prefix anything you want, best practice is usually `/` or `!`, but you can use it with words as well, like `!music`.
 
 ```bash
 DISCORD_TOKEN=your_token_here
-DISCORD_PREFIX=!your_prefix_here
+DISCORD_PREFIX=your_prefix_here
 ```
 
-5. **Run the bot**
+### 5. **Run the bot**
 
 ```bash
 python main.py
 ```
 
 ## Commands
-
-All commands are prefixed with `/zene ` (with a space).
 
 | Command                    | Description                           |
 | -------------------------- | ------------------------------------- |
@@ -112,4 +104,4 @@ The bot creates a per-guild queue using asyncio.Queue() to manage independent se
 
 ## **📄 License**
 
-MIT License
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
