@@ -103,7 +103,7 @@ pip install -r requirements.txt
 
 You can set your prefix anything you want, best practice is usually `/` or `!`, but you can use it with words as well, like `!music`.
 
-```bash
+```env
 DISCORD_TOKEN=your_token_here
 DISCORD_PREFIX=your_prefix_here
 ```
