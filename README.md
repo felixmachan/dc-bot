@@ -19,6 +19,50 @@ Supports YouTube streaming with a queue, pause/resume, skip, and current playing
 - Recommended: Virtual environment
 - A server if you want to host it 24/7
 
+## 🤖 Discord Bot Setup Guide
+
+Follow these steps to create your bot and get your token:
+
+### 1. Create the Application
+
+- Go to the [Discord Developer Portal](https://discord.com/developers/applications)
+- Click on **"New Application"**
+- Give it a name (e.g. `musicBOT`) and click **Create**
+
+### 2. Add a Bot User
+
+- In your application, go to the **"Bot"** tab
+- Click **"Add Bot"** → **Yes, do it!**
+- (Optional) Set a profile picture and name for the bot
+
+### 3. Get the Bot Token
+
+- In the **"Bot"** tab, click **"Reset Token"** and **Copy**
+- ⚠️ **Keep your token secret!** Never share it or commit it to GitHub
+
+### 4. Set Intents
+
+- Still in the **"Bot"** tab, enable:
+  - ✅ **MESSAGE CONTENT INTENT**
+  - ✅ **SERVER MEMBERS INTENT** (optional, but safe to check)
+
+### 5. Invite the Bot to Your Server
+
+- Go to the **"OAuth2" → "URL Generator"**
+- Select:
+  - Scopes: `bot`
+  - Bot Permissions: `Connect`, `Speak`, `Read Messages/View Channels`, `Send Messages`
+- Copy the generated URL and open it in your browser
+- Select your server and **Authorize** the bot
+
+### 6. Add Token to Your .env
+
+Make sure your `.env` file contains:
+
+```env
+DISCORD_TOKEN=your_token_here
+```
+
 ## 🧪 Setup
 
 ### 0. **Install required packages**
