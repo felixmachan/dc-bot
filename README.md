@@ -140,11 +140,11 @@ your_prefix np
 
 ## **🚨 Notes**
 
-If a YouTube video requires login (age-restricted or private), yt-dlp may fail. See the yt-dlp cookies guide for more.
+If a YouTube video requires login (age-restricted or private), `yt-dlp` may fail. See the **yt-dlp cookies guide** for more.
 
-Make sure FFmpeg is installed and accessible globally via ffmpeg in the command line.
+Make sure FFmpeg is installed and accessible globally via `ffmpeg` in the command line.
 
-The bot creates a per-guild queue using asyncio.Queue() to manage independent sessions.
+The bot creates a per-guild queue using `asyncio.Queue()` to manage independent sessions.
 
 ## **📄 License**
 
