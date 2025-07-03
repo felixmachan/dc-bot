@@ -101,7 +101,9 @@ async def play(ctx, *, query):
         formats = entry.get('formats', [])
         audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
         if audio_formats:
-            audio_formats.sort(key=lambda x: x.get('abr') or 0, reverse=True)
+            audio_formats.sort(key=lambda f: f.get('abr') or f.get('asr') or 0, reverse=True)
+
+
             audio_url = audio_formats[0]['url']
         else:
             audio_url = entry.get('url')
@@ -126,6 +128,8 @@ async def play(ctx, *, query):
 
 async def play_next(guild):
     vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return
     queue = get_guild_queue(guild.id)
 
     if queue.empty():
@@ -133,15 +137,22 @@ async def play_next(guild):
         return
 
     url, title, ctx = await queue.get()
-    source = await discord.FFmpegOpusAudio.from_probe(url)
+    source = discord.FFmpegPCMAudio(
+    url,
+    before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin",
+    options="-vn -loglevel panic"
+)
+
 
     def after(e):
-        fut = play_next(guild)
-        fut = asyncio.run_coroutine_threadsafe(fut, bot.loop)
+        if e:
+            print(f"Hiba a lejátszás közben: {e}")
+        fut = asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
         try:
             fut.result()
         except Exception as exc:
             print(f"Hiba a következő szám lejátszásánál: {exc}")
+
 
     now_playing[guild.id] = title
     vc.play(source, after=after)
