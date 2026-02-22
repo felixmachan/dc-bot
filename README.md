@@ -1,17 +1,17 @@
 # 🎵 Discord Music Bot
 
-A simple yet functional Discord music bot built with Python, [discord.py](https://discordpy.readthedocs.io/), and [yt-dlp](https://github.com/yt-dlp/yt-dlp).  
-Supports YouTube streaming with a queue, pause/resume, skip, and current playing info.
+A simple yet functional Discord music bot built with Python, [discord.py](https://discordpy.readthedocs.io/), [yt‑dlp](https://github.com/yt-dlp/yt-dlp), and [spotipy](https://spotipy.readthedocs.io/).
+Supports streaming from YouTube and Spotify (tracks, albums, playlists) with both prefix and slash commands (with autocomplete), queue management, pause/resume/skip controls, and now playing info.
 
 ## ⚙️ Features
 
-- ✅ Join and leave voice channels
-- 🔍 Search for music on YouTube
-- 🎧 Stream music (no download required)
-- ➕ Queue management (add multiple songs)
+- - ✅ Join and leave voice channels
+- 🔍 Search for music on YouTube or load Spotify tracks, albums and playlists
+- 🎷 Stream music (no download required)
+- ➕ Queue management: add multiple songs, view (`queue`), shuffle (`shuffle`) and clear (`stop`)
 - ⏸️ Pause / ▶️ Resume / ⏭️ Skip songs
-- 📝 Display the currently playing track
-
+- 🔁 Use slash commands with autocomplete (e.g., `/play`) for quick selection
+- 👍 Display the currently playing track
 ## 📦 Requirements
 
 - Python 3.9+
