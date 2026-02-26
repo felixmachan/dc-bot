@@ -250,7 +250,10 @@ async def on_ready():
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
             guild_synced = await bot.tree.sync(guild=guild_obj)
-            print(f"Guild slash sync kesz: {len(guild_synced)} parancs (guild_id={GUILD_ID}).")
+            print(
+                f"Guild slash sync kesz: {len(guild_synced)} parancs (guild_id={GUILD_ID}). "
+                "Globalis command setup mellett itt 0 normalis lehet."
+            )
     except Exception as e:
         print(f"Slash parancsok szinkronizalasa sikertelen: {e}")
 
@@ -284,7 +287,7 @@ async def join(ctx):
         channel = ctx.author.voice.channel
         try:
             if ctx.voice_client is None:
-                await channel.connect(timeout=10)
+                await channel.connect(timeout=30, reconnect=True)
             else:
                 await ctx.voice_client.move_to(channel)
             await ctx.send(f"🔊 Csatlakoztam a(z) {channel.name} csatornához!")
@@ -504,7 +507,7 @@ async def join_slash(interaction: discord.Interaction):
         channel = interaction.user.voice.channel  # type: ignore[assignment]
         try:
             if interaction.guild.voice_client is None:
-                await channel.connect(timeout=10)
+                await channel.connect(timeout=30, reconnect=True)
             else:
                 await interaction.guild.voice_client.move_to(channel)  # type: ignore[union-attr]
             await interaction.response.send_message(f"Csatlakoztam a(z) {channel.name} csatornahoz!")
@@ -536,7 +539,7 @@ async def play_slash(interaction: discord.Interaction, query: str):
         if interaction.user.voice:
             channel = interaction.user.voice.channel  # type: ignore[assignment]
             try:
-                await channel.connect(timeout=10)
+                await channel.connect(timeout=30, reconnect=True)
             except asyncio.TimeoutError:
                 await interaction.followup.send("Nem sikerult csatlakozni a voice csatornahoz: timeout.")
                 return
