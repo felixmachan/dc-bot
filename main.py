@@ -4,6 +4,7 @@ import asyncio
 import random
 import glob
 import shutil
+import time
 from typing import List, Tuple, Optional, Iterable
 
 import discord
@@ -53,6 +54,8 @@ voice_reconnect_locks: dict[int, asyncio.Lock] = {}
 last_voice_channel_id: dict[int, int] = {}
 track_recovery_attempts: dict[int, int] = {}
 MAX_TRACK_RECOVERY_ATTEMPTS = 2
+autocomplete_cache: dict[str, Tuple[float, List[str]]] = {}
+AUTOCOMPLETE_CACHE_TTL_SECONDS = 30.0
 
 
 def find_ffmpeg_executable() -> Optional[str]:
@@ -154,9 +157,16 @@ async def yt_autocomplete(
     List[app_commands.Choice[str]]
         A list of up to five choices containing song titles.
     """
-    # Don't return suggestions for empty input to avoid spamming the API
-    if not current:
+    # Keep autocomplete fast: short inputs are often noisy and increase timeout risk.
+    query = current.strip()
+    if len(query) < 2:
         return []
+    cache_key = query.lower()
+    now = time.monotonic()
+    cached = autocomplete_cache.get(cache_key)
+    if cached and now - cached[0] < AUTOCOMPLETE_CACHE_TTL_SECONDS:
+        return [app_commands.Choice(name=title, value=title) for title in cached[1]]
+
     # Prepare search options: flat extraction to avoid deep info and limit results
     search_opts = {
         'format': 'bestaudio/best',
@@ -165,21 +175,30 @@ async def yt_autocomplete(
         'extract_flat': True,
         'skip_download': True,
     }
-    suggestions: List[app_commands.Choice[str]] = []
-    try:
-        # Search for up to 5 results using ytsearch5:
+
+    def _fetch_titles() -> List[str]:
         with yt_dlp.YoutubeDL(search_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch5:{current}", download=False)
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+        titles: List[str] = []
         for entry in info.get('entries', []):
             title = entry.get('title')
             if title:
-                suggestions.append(app_commands.Choice(name=title, value=title))
-            if len(suggestions) >= 5:
+                # Discord choice name/value length safety.
+                titles.append(title[:100])
+            if len(titles) >= 5:
                 break
-    except Exception:
-        # On error just return an empty list (no suggestions)
+        return titles
+
+    try:
+        # Autocomplete has a strict response window; abort slow lookups quickly.
+        titles = await asyncio.wait_for(asyncio.to_thread(_fetch_titles), timeout=2.2)
+        autocomplete_cache[cache_key] = (now, titles)
+        return [app_commands.Choice(name=title, value=title) for title in titles]
+    except asyncio.TimeoutError:
         return []
-    return suggestions
+    except Exception:
+        # On error just return an empty list (no suggestions).
+        return []
 
 
 async def search_youtube(term: str) -> Optional[Tuple[str, str]]:
