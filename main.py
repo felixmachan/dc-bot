@@ -41,6 +41,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+last_resync_ts: float = 0.0
 
 # Per‑guild song queues and currently playing information
 # Each item in the queue is a tuple of (audio_url, title, target)
@@ -242,16 +243,39 @@ async def get_spotify_tracks(url: str) -> List[str]:
 async def on_ready():
     print(f"Bot elindult: {bot.user}")
     try:
+        # Keep a global registration for portability across guilds.
+        # If a guild ID is configured, sync that too for faster propagation there.
+        global_synced = await bot.tree.sync()
+        print(f"Global slash sync kesz: {len(global_synced)} parancs.")
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
-            synced = await bot.tree.sync(guild=guild_obj)
-            print(f"Guild slash sync kesz: {len(synced)} parancs (guild_id={GUILD_ID}).")
-        else:
-            # Global sync can take time to propagate in Discord clients.
-            synced = await bot.tree.sync()
-            print(f"Global slash sync kesz: {len(synced)} parancs.")
+            guild_synced = await bot.tree.sync(guild=guild_obj)
+            print(f"Guild slash sync kesz: {len(guild_synced)} parancs (guild_id={GUILD_ID}).")
     except Exception as e:
         print(f"Slash parancsok szinkronizalasa sikertelen: {e}")
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    global last_resync_ts
+    if isinstance(error, app_commands.CommandNotFound):
+        now = asyncio.get_running_loop().time()
+        # Prevent sync storms if many users invoke stale slash commands.
+        if now - last_resync_ts > 60:
+            last_resync_ts = now
+            try:
+                if interaction.guild:
+                    await bot.tree.sync(guild=interaction.guild)
+                await bot.tree.sync()
+            except Exception as sync_err:
+                print(f"Automatikus slash re-sync sikertelen: {sync_err}")
+        msg = "A slash parancsok frissulnek. Probald ujra par masodperc mulva."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+    print(f"App command hiba: {error}")
 
 @bot.command(name='join')
 async def join(ctx):
@@ -651,10 +675,7 @@ async def shuffle_slash(interaction: discord.Interaction):
     await interaction.response.send_message("A varolista megkeverve.")
 
 
-if GUILD_ID:
-    bot.tree.add_command(music_group, guild=discord.Object(id=GUILD_ID))
-else:
-    bot.tree.add_command(music_group)
+bot.tree.add_command(music_group)
 
 # Start the bot after registering all commands
 bot.run(TOKEN)
