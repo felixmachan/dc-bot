@@ -202,7 +202,7 @@ async def yt_autocomplete(
 
     # Never block autocomplete on network I/O; return fast to avoid 10062 Unknown interaction.
     if cache_key not in autocomplete_inflight:
-        autocomplete_inflight[cache_key] = bot.loop.create_task(_populate_cache())
+        autocomplete_inflight[cache_key] = asyncio.create_task(_populate_cache())
     return []
 
 
@@ -216,9 +216,15 @@ async def search_youtube(term: str) -> Optional[Tuple[str, str]]:
         'skip_download': True,
     }
     search_term = term if is_url(term) else f"ytsearch:{term}"
-    try:
+    def _extract() -> object:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_term, download=False)
+            return ydl.extract_info(search_term, download=False)
+
+    try:
+        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=15.0)
+    except asyncio.TimeoutError:
+        print(f"yt-dlp search timeout for term '{term}'")
+        return None
     except Exception as e:
         print(f"yt-dlp search error for term '{term}': {e}")
         return None
@@ -257,27 +263,37 @@ async def get_spotify_tracks(url: str) -> List[str]:
     if not parsed:
         return result
     content_type, spotify_id = parsed
-    try:
+    def _fetch_tracks() -> List[str]:
+        local_result: List[str] = []
         if content_type == 'track':
             track = SPOTIFY_CLIENT.track(spotify_id)
             name = track['name']
             artists = ', '.join(artist['name'] for artist in track['artists'])
-            result.append(f"{name} {artists}")
+            local_result.append(f"{name} {artists}")
         elif content_type == 'album':
             album_tracks = SPOTIFY_CLIENT.album_tracks(spotify_id)
             for item in album_tracks['items']:
                 name = item['name']
                 artists = ', '.join(artist['name'] for artist in item['artists'])
-                result.append(f"{name} {artists}")
+                local_result.append(f"{name} {artists}")
         elif content_type == 'playlist':
             # limit to first 50 tracks to prevent huge queues
-            playlist_tracks = SPOTIFY_CLIENT.playlist_items(spotify_id, fields='items(track(name,artists(name)))', additional_types=['track'], limit=50)
+            playlist_tracks = SPOTIFY_CLIENT.playlist_items(
+                spotify_id,
+                fields='items(track(name,artists(name)))',
+                additional_types=['track'],
+                limit=50
+            )
             for item in playlist_tracks['items']:
                 track = item['track']
                 if track:
                     name = track['name']
                     artists = ', '.join(a['name'] for a in track['artists'])
-                    result.append(f"{name} {artists}")
+                    local_result.append(f"{name} {artists}")
+        return local_result
+
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(_fetch_tracks), timeout=15.0)
     except Exception as e:
         print(f"Failed to fetch Spotify data: {e}")
     return result
