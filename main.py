@@ -56,6 +56,7 @@ track_recovery_attempts: dict[int, int] = {}
 MAX_TRACK_RECOVERY_ATTEMPTS = 2
 autocomplete_cache: dict[str, Tuple[float, List[str]]] = {}
 AUTOCOMPLETE_CACHE_TTL_SECONDS = 30.0
+autocomplete_inflight: dict[str, asyncio.Task] = {}
 
 
 def find_ffmpeg_executable() -> Optional[str]:
@@ -189,16 +190,20 @@ async def yt_autocomplete(
                 break
         return titles
 
-    try:
-        # Autocomplete has a strict response window; abort slow lookups quickly.
-        titles = await asyncio.wait_for(asyncio.to_thread(_fetch_titles), timeout=2.2)
-        autocomplete_cache[cache_key] = (now, titles)
-        return [app_commands.Choice(name=title, value=title) for title in titles]
-    except asyncio.TimeoutError:
-        return []
-    except Exception:
-        # On error just return an empty list (no suggestions).
-        return []
+    async def _populate_cache() -> None:
+        try:
+            # Populate cache in the background so autocomplete response stays immediate.
+            titles = await asyncio.wait_for(asyncio.to_thread(_fetch_titles), timeout=4.0)
+            autocomplete_cache[cache_key] = (time.monotonic(), titles)
+        except Exception:
+            pass
+        finally:
+            autocomplete_inflight.pop(cache_key, None)
+
+    # Never block autocomplete on network I/O; return fast to avoid 10062 Unknown interaction.
+    if cache_key not in autocomplete_inflight:
+        autocomplete_inflight[cache_key] = bot.loop.create_task(_populate_cache())
+    return []
 
 
 async def search_youtube(term: str) -> Optional[Tuple[str, str]]:
@@ -417,6 +422,9 @@ async def retry_play_next_later(guild: discord.Guild, delay_seconds: float = 2.0
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     global last_resync_ts
+    if isinstance(error, app_commands.CommandInvokeError) and isinstance(error.original, discord.NotFound):
+        # Interaction token likely expired; avoid noisy logs.
+        return
     if isinstance(error, app_commands.CommandNotFound):
         now = asyncio.get_running_loop().time()
         # Prevent sync storms if many users invoke stale slash commands.
