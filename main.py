@@ -185,6 +185,36 @@ async def connect_voice_with_retries(
     reason: str,
 ) -> Tuple[Optional[discord.VoiceClient], str]:
     """Connect or move voice client with deterministic retries and backoff."""
+    async def reset_voice_client_state(channel_id: Optional[int], attempt: int) -> None:
+        """Force cleanup of partially-initialized voice clients between retries."""
+        current_vc = guild.voice_client
+        if not current_vc:
+            return
+        try:
+            await current_vc.disconnect(force=True)
+        except Exception as cleanup_err:
+            log_voice_event(
+                "retry_cleanup_disconnect_failed",
+                guild.id,
+                channel_id=channel_id,
+                attempt=attempt,
+                exception=cleanup_err,
+                level=logging.WARNING,
+            )
+        try:
+            cleanup = getattr(current_vc, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+        except Exception as cleanup_err:
+            log_voice_event(
+                "retry_cleanup_finalize_failed",
+                guild.id,
+                channel_id=channel_id,
+                attempt=attempt,
+                exception=cleanup_err,
+                level=logging.WARNING,
+            )
+
     reconnect_lock = get_voice_reconnect_lock(guild.id)
     last_error_code = VOICE_CONNECT_TIMEOUT_CODE
 
@@ -224,7 +254,8 @@ async def connect_voice_with_retries(
                             )
                     await channel.connect(
                         timeout=VOICE_CONNECT_TIMEOUT_SEC,
-                        reconnect=True,
+                        # We handle retries explicitly in this function.
+                        reconnect=False,
                         self_deaf=True,
                     )
 
@@ -256,6 +287,19 @@ async def connect_voice_with_retries(
                     elapsed_ms=int((time.monotonic() - started) * 1000),
                     level=logging.WARNING,
                 )
+                await reset_voice_client_state(channel_id, attempt)
+            except discord.ConnectionClosed as closed_err:
+                last_error_code = VOICE_CONNECT_UNSTABLE_CODE
+                log_voice_event(
+                    "connect_ws_closed",
+                    guild.id,
+                    channel_id=channel_id,
+                    attempt=attempt,
+                    exception=closed_err,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    level=logging.WARNING,
+                )
+                await reset_voice_client_state(channel_id, attempt)
             except discord.ClientException as client_err:
                 last_error_code = VOICE_CONNECT_UNSTABLE_CODE
                 log_voice_event(
@@ -267,6 +311,7 @@ async def connect_voice_with_retries(
                     elapsed_ms=int((time.monotonic() - started) * 1000),
                     level=logging.WARNING,
                 )
+                await reset_voice_client_state(channel_id, attempt)
             except Exception as conn_err:
                 last_error_code = VOICE_CONNECT_UNSTABLE_CODE
                 log_voice_event(
@@ -278,6 +323,7 @@ async def connect_voice_with_retries(
                     elapsed_ms=int((time.monotonic() - started) * 1000),
                     level=logging.ERROR,
                 )
+                await reset_voice_client_state(channel_id, attempt)
 
             if attempt < VOICE_CONNECT_RETRIES:
                 await asyncio.sleep(VOICE_RETRY_BACKOFF_SEC * attempt)
@@ -384,11 +430,17 @@ async def yt_autocomplete(
 async def search_youtube(term: str) -> Optional[Tuple[str, str]]:
     """Search YouTube using yt_dlp and return the first audio result (url, title)."""
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio[acodec!=none]/best',
         'quiet': True,
         'noplaylist': True,
         'extract_flat': False,
         'skip_download': True,
+        # Prefer clients that usually expose direct media URLs over SABR-limited web formats.
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+            }
+        },
     }
     search_term = term if is_url(term) else f"ytsearch:{term}"
     def _extract() -> object:
@@ -408,14 +460,22 @@ async def search_youtube(term: str) -> Optional[Tuple[str, str]]:
     if not entries:
         return None
     entry = entries[0]
-    # Determine audio URL
-    formats = entry.get('formats', [])
-    audio_formats = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
-    if audio_formats:
-        audio_formats.sort(key=lambda f: f.get('abr') or f.get('asr') or 0, reverse=True)
-        audio_url = audio_formats[0]['url']
-    else:
-        audio_url = entry.get('url')
+    # Let yt-dlp provide the final selected URL first; manual format fallback only if needed.
+    audio_url = entry.get('url')
+    if not audio_url:
+        formats = entry.get('formats', [])
+        audio_formats = [
+            f for f in formats
+            if f.get('acodec') != 'none'
+            and f.get('vcodec') == 'none'
+            and f.get('url')
+            and f.get('protocol') not in {'m3u8', 'http_dash_segments'}
+        ]
+        if audio_formats:
+            audio_formats.sort(key=lambda f: f.get('abr') or f.get('asr') or 0, reverse=True)
+            audio_url = audio_formats[0]['url']
+        else:
+            return None
     title = entry.get('title', 'Ismeretlen')
     return audio_url, title
 
