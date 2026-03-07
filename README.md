@@ -106,6 +106,10 @@ You can set your prefix anything you want, best practice is usually `/` or `!`, 
 ```env
 DISCORD_TOKEN=your_token_here
 DISCORD_PREFIX=your_prefix_here
+VOICE_CONNECT_TIMEOUT_SEC=30
+VOICE_CONNECT_RETRIES=3
+VOICE_RETRY_BACKOFF_SEC=2
+BOT_LOG_LEVEL=INFO
 ```
 
 ### 5. **Run the bot**
@@ -149,3 +153,4 @@ The bot creates a per-guild queue using `asyncio.Queue()` to manage independent 
 ## **📄 License**
 
 This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+

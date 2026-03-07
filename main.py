@@ -5,6 +5,7 @@ import random
 import glob
 import shutil
 import time
+import logging
 from typing import List, Tuple, Optional, Iterable
 
 import discord
@@ -28,11 +29,47 @@ load_dotenv()
 # --------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------
+def parse_int_env(name: str, default: int, minimum: int = 1) -> int:
+    """Parse positive integer env vars with fallback and warning."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+        if value < minimum:
+            raise ValueError(f"{name} must be >= {minimum}")
+        return value
+    except ValueError:
+        logging.getLogger("dc_bot").warning(
+            "Invalid %s=%r. Using default=%d.", name, raw, default
+        )
+        return default
+
+
+def parse_log_level(default: str = "INFO") -> str:
+    """Parse BOT_LOG_LEVEL and fallback to INFO on invalid values."""
+    raw = (os.getenv("BOT_LOG_LEVEL") or default).upper()
+    if raw not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
+        logging.getLogger("dc_bot").warning(
+            "Invalid BOT_LOG_LEVEL=%r. Using default=%s.", raw, default
+        )
+        return default
+    return raw
 # Bot token and prefix from environment; prefix defaults to '!'
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("DISCORD_PREFIX", "!")
 GUILD_ID_RAW = os.getenv("DISCORD_GUILD_ID")
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else None
+VOICE_CONNECT_TIMEOUT_SEC = parse_int_env("VOICE_CONNECT_TIMEOUT_SEC", 30, minimum=5)
+VOICE_CONNECT_RETRIES = parse_int_env("VOICE_CONNECT_RETRIES", 3, minimum=1)
+VOICE_RETRY_BACKOFF_SEC = parse_int_env("VOICE_RETRY_BACKOFF_SEC", 2, minimum=1)
+
+LOG_LEVEL = parse_log_level()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("dc_bot")
 
 # Spotify credentials (optional)
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
@@ -57,6 +94,8 @@ MAX_TRACK_RECOVERY_ATTEMPTS = 2
 autocomplete_cache: dict[str, Tuple[float, List[str]]] = {}
 AUTOCOMPLETE_CACHE_TTL_SECONDS = 30.0
 autocomplete_inflight: dict[str, asyncio.Task] = {}
+VOICE_CONNECT_TIMEOUT_CODE = "VOICE_CONNECT_TIMEOUT"
+VOICE_CONNECT_UNSTABLE_CODE = "VOICE_CONNECT_UNSTABLE"
 
 
 def find_ffmpeg_executable() -> Optional[str]:
@@ -109,6 +148,142 @@ def get_voice_reconnect_lock(guild_id: int) -> asyncio.Lock:
         voice_reconnect_locks[guild_id] = asyncio.Lock()
     return voice_reconnect_locks[guild_id]
 
+
+def log_voice_event(
+    phase: str,
+    guild_id: int,
+    channel_id: Optional[int] = None,
+    attempt: Optional[int] = None,
+    exception: Optional[Exception] = None,
+    elapsed_ms: Optional[int] = None,
+    level: int = logging.INFO,
+):
+    """Emit structured logs for voice connect and recovery flow."""
+    fields = [
+        f"phase={phase}",
+        f"guild_id={guild_id}",
+        f"channel_id={channel_id if channel_id is not None else 'none'}",
+        f"attempt={attempt if attempt is not None else 'none'}",
+        f"exception_type={type(exception).__name__ if exception else 'none'}",
+        f"elapsed_ms={elapsed_ms if elapsed_ms is not None else 'none'}",
+    ]
+    logger.log(level, "VOICE_EVENT %s", " ".join(fields))
+
+
+def voice_error_message(error_code: str) -> str:
+    """Translate internal voice error codes to user-facing messages."""
+    if error_code == VOICE_CONNECT_TIMEOUT_CODE:
+        return "Nem sikerult csatlakozni a voice csatornahoz (hiba: VOICE_CONNECT_TIMEOUT)."
+    if error_code == VOICE_CONNECT_UNSTABLE_CODE:
+        return "A voice kapcsolat instabil (hiba: VOICE_CONNECT_UNSTABLE)."
+    return "Nem sikerult csatlakozni a voice csatornahoz."
+
+
+async def connect_voice_with_retries(
+    guild: discord.Guild,
+    channel: discord.abc.Connectable,
+    reason: str,
+) -> Tuple[Optional[discord.VoiceClient], str]:
+    """Connect or move voice client with deterministic retries and backoff."""
+    reconnect_lock = get_voice_reconnect_lock(guild.id)
+    last_error_code = VOICE_CONNECT_TIMEOUT_CODE
+
+    async with reconnect_lock:
+        for attempt in range(1, VOICE_CONNECT_RETRIES + 1):
+            started = time.monotonic()
+            vc = guild.voice_client
+            channel_id = getattr(channel, "id", None)
+            log_voice_event("connect_start", guild.id, channel_id=channel_id, attempt=attempt)
+            try:
+                if vc and vc.is_connected() and vc.channel and vc.channel.id == channel_id:
+                    log_voice_event(
+                        "already_connected",
+                        guild.id,
+                        channel_id=channel_id,
+                        attempt=attempt,
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                    )
+                    last_voice_channel_id[guild.id] = channel_id
+                    return vc, ""
+
+                if vc and vc.is_connected() and vc.channel and vc.channel.id != channel_id:
+                    log_voice_event("move_to", guild.id, channel_id=channel_id, attempt=attempt)
+                    await vc.move_to(channel)  # type: ignore[arg-type]
+                else:
+                    if vc and not vc.is_connected():
+                        try:
+                            await vc.disconnect(force=True)
+                        except Exception as stale_err:
+                            log_voice_event(
+                                "stale_disconnect_failed",
+                                guild.id,
+                                channel_id=channel_id,
+                                attempt=attempt,
+                                exception=stale_err,
+                                level=logging.WARNING,
+                            )
+                    await channel.connect(
+                        timeout=VOICE_CONNECT_TIMEOUT_SEC,
+                        reconnect=True,
+                        self_deaf=True,
+                    )
+
+                await asyncio.sleep(0.6)
+                vc = guild.voice_client
+                if vc and vc.is_connected() and vc.channel and vc.channel.id == channel_id:
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    log_voice_event("connect_success", guild.id, channel_id=channel_id, attempt=attempt, elapsed_ms=elapsed_ms)
+                    last_voice_channel_id[guild.id] = channel_id
+                    return vc, ""
+
+                last_error_code = VOICE_CONNECT_UNSTABLE_CODE
+                log_voice_event(
+                    "connect_unstable",
+                    guild.id,
+                    channel_id=channel_id,
+                    attempt=attempt,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    level=logging.WARNING,
+                )
+            except asyncio.TimeoutError as timeout_err:
+                last_error_code = VOICE_CONNECT_TIMEOUT_CODE
+                log_voice_event(
+                    "connect_timeout",
+                    guild.id,
+                    channel_id=channel_id,
+                    attempt=attempt,
+                    exception=timeout_err,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    level=logging.WARNING,
+                )
+            except discord.ClientException as client_err:
+                last_error_code = VOICE_CONNECT_UNSTABLE_CODE
+                log_voice_event(
+                    "connect_client_exception",
+                    guild.id,
+                    channel_id=channel_id,
+                    attempt=attempt,
+                    exception=client_err,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    level=logging.WARNING,
+                )
+            except Exception as conn_err:
+                last_error_code = VOICE_CONNECT_UNSTABLE_CODE
+                log_voice_event(
+                    "connect_exception",
+                    guild.id,
+                    channel_id=channel_id,
+                    attempt=attempt,
+                    exception=conn_err,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    level=logging.ERROR,
+                )
+
+            if attempt < VOICE_CONNECT_RETRIES:
+                await asyncio.sleep(VOICE_RETRY_BACKOFF_SEC * attempt)
+
+    logger.error("Voice connect failed reason=%s guild_id=%s", reason, guild.id)
+    return None, last_error_code
 
 def is_url(text: str) -> bool:
     """Check if the provided text looks like a URL."""
@@ -223,10 +398,10 @@ async def search_youtube(term: str) -> Optional[Tuple[str, str]]:
     try:
         info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=15.0)
     except asyncio.TimeoutError:
-        print(f"yt-dlp search timeout for term '{term}'")
+        logger.warning("yt-dlp search timeout term=%r", term)
         return None
     except Exception as e:
-        print(f"yt-dlp search error for term '{term}': {e}")
+        logger.error("yt-dlp search error term=%r error=%s", term, e)
         return None
     # Normalise entries
     entries = info.get('entries', [info])
@@ -295,27 +470,24 @@ async def get_spotify_tracks(url: str) -> List[str]:
     try:
         result = await asyncio.wait_for(asyncio.to_thread(_fetch_tracks), timeout=15.0)
     except Exception as e:
-        print(f"Failed to fetch Spotify data: {e}")
+        logger.warning("Spotify fetch failed error=%s", e)
     return result
 
 
 @bot.event
 async def on_ready():
-    print(f"Bot elindult: {bot.user}")
+    logger.info("Bot elindult user=%s", bot.user)
     try:
         # Keep a global registration for portability across guilds.
         # If a guild ID is configured, sync that too for faster propagation there.
         global_synced = await bot.tree.sync()
-        print(f"Global slash sync kesz: {len(global_synced)} parancs.")
+        logger.info("Global slash sync kesz count=%d", len(global_synced))
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
             guild_synced = await bot.tree.sync(guild=guild_obj)
-            print(
-                f"Guild slash sync kesz: {len(guild_synced)} parancs (guild_id={GUILD_ID}). "
-                "Globalis command setup mellett itt 0 normalis lehet."
-            )
+            logger.info("Guild slash sync kesz count=%d guild_id=%s", len(guild_synced), GUILD_ID)
     except Exception as e:
-        print(f"Slash parancsok szinkronizalasa sikertelen: {e}")
+        logger.error("Slash parancs sync sikertelen error=%s", e)
 
 
 async def safe_send(target: object, message: str):
@@ -325,14 +497,11 @@ async def safe_send(target: object, message: str):
     except AttributeError:
         await target.followup.send(message)  # type: ignore[attr-defined]
     except Exception as send_err:
-        print(f"Nem sikerult uzenetet kuldeni: {send_err}")
+        logger.warning("safe_send failed error=%s", send_err)
 
 
 async def ensure_voice_connection(guild: discord.Guild, target: Optional[object] = None) -> Optional[discord.VoiceClient]:
-    """
-    Ensure bot has an active voice connection for a guild.
-    If disconnected unexpectedly, try to reconnect to the last known voice channel.
-    """
+    """Ensure active voice connection, attempting reconnect to last known channel."""
     vc = guild.voice_client
     if vc and vc.is_connected():
         if vc.channel:
@@ -344,30 +513,13 @@ async def ensure_voice_connection(guild: discord.Guild, target: Optional[object]
     if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         return None
 
-    reconnect_lock = get_voice_reconnect_lock(guild.id)
-    async with reconnect_lock:
-        vc = guild.voice_client
-        if vc and vc.is_connected():
-            return vc
-        for attempt in range(1, 4):
-            try:
-                if vc:
-                    await vc.move_to(channel)
-                else:
-                    await channel.connect(timeout=20, reconnect=True, self_deaf=True)
-                await asyncio.sleep(1)
-                vc = guild.voice_client
-                if vc and vc.is_connected():
-                    last_voice_channel_id[guild.id] = channel.id
-                    if target:
-                        await safe_send(target, "Kapcsolat megszakadt, ujracsatlakoztam a voice csatornahoz.")
-                    return vc
-            except Exception as conn_err:
-                print(f"Voice ujracsatlakozas sikertelen (kiserlet {attempt}/3): {conn_err}")
-                await asyncio.sleep(attempt)
+    vc, error_code = await connect_voice_with_retries(guild, channel, reason="recovery")
+    if vc and target:
+        await safe_send(target, "Kapcsolat megszakadt, ujracsatlakoztam a voice csatornahoz.")
+    if not vc:
+        log_voice_event("recovery_failed", guild.id, channel_id=channel_id, level=logging.WARNING)
+    return vc
 
-    vc = guild.voice_client
-    return vc if vc and vc.is_connected() else None
 
 
 async def start_track(guild: discord.Guild, url: str, title: str, target: object, announce: bool = True) -> bool:
@@ -376,7 +528,7 @@ async def start_track(guild: discord.Guild, url: str, title: str, target: object
     if not vc:
         return False
     if not FFMPEG_EXE:
-        print("FFmpeg nincs telepitve vagy nem talalhato. Telepitsd es inditsd ujra a botot.")
+        logger.error("FFmpeg nincs telepitve vagy nem talalhato.")
         return False
 
     source = discord.FFmpegPCMAudio(
@@ -394,12 +546,12 @@ async def start_track(guild: discord.Guild, url: str, title: str, target: object
         try:
             fut.result()
         except Exception as exc:
-            print(f"Hiba a track end kezelesenel: {exc}")
+            logger.error("Track end callback hiba error=%s", exc)
 
     try:
         vc.play(source, after=after)
     except Exception as play_err:
-        print(f"Lejatszas inditasi hiba: {play_err}")
+        logger.error("Lejatszas inditasi hiba error=%s", play_err)
         source.cleanup()
         return False
 
@@ -413,7 +565,7 @@ async def start_track(guild: discord.Guild, url: str, title: str, target: object
 async def handle_track_end(guild: discord.Guild, error: Optional[Exception]):
     """Handle playback completion and retry current track on transient errors."""
     if error:
-        print(f"Lejatszasi hiba: {error}")
+        logger.warning("Lejatszasi hiba error=%s", error)
         track = current_track.get(guild.id)
         if track:
             attempts = track_recovery_attempts.get(guild.id, 0)
@@ -451,14 +603,14 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
                     await bot.tree.sync(guild=interaction.guild)
                 await bot.tree.sync()
             except Exception as sync_err:
-                print(f"Automatikus slash re-sync sikertelen: {sync_err}")
+                logger.warning("Automatikus slash re-sync sikertelen error=%s", sync_err)
         msg = "A slash parancsok frissulnek. Probald ujra par masodperc mulva."
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
             await interaction.response.send_message(msg, ephemeral=True)
         return
-    print(f"App command hiba: {error}")
+    logger.error("App command hiba error=%s", error)
 
 
 @bot.event
@@ -490,21 +642,17 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 @bot.command(name='join')
 async def join(ctx):
     """Join the voice channel that the user is currently in."""
-    if ctx.author.voice:
-        channel = ctx.author.voice.channel
-        try:
-            if ctx.voice_client is None:
-                await channel.connect(timeout=30, reconnect=True, self_deaf=True)
-            else:
-                await ctx.voice_client.move_to(channel)
-            last_voice_channel_id[ctx.guild.id] = channel.id
-            await ctx.send(f"🔊 Csatlakoztam a(z) {channel.name} csatornához!")
-        except asyncio.TimeoutError:
-            await ctx.send("⚠️ Nem sikerült csatlakozni a voice csatornához: timeout.")
-        except Exception as e:
-            await ctx.send(f"⚠️ Hiba történt a csatlakozás során: {e}")
-    else:
-        await ctx.send("Előbb csatlakozz egy hangcsatornához!")
+    if not ctx.author.voice:
+        await ctx.send("Elobb csatlakozz egy hangcsatornahoz!")
+        return
+
+    channel = ctx.author.voice.channel
+    vc, error_code = await connect_voice_with_retries(ctx.guild, channel, reason="join_prefix")
+    if not vc:
+        await ctx.send(voice_error_message(error_code))
+        return
+
+    await ctx.send(f"Csatlakoztam a(z) {channel.name} csatornahoz!")
 
 
 @bot.command(name='leave')
@@ -522,20 +670,25 @@ async def play(ctx, *, query: str):
     """Play a song from YouTube or process Spotify URLs. Add to queue if already playing."""
     vc = ctx.voice_client
     if not vc:
-        await ctx.invoke(join)
-        vc = ctx.voice_client
-        if not vc:
+        if not ctx.author.voice:
+            await ctx.send("Elobb csatlakozz egy hangcsatornahoz!")
             return
+        channel = ctx.author.voice.channel
+        vc, error_code = await connect_voice_with_retries(ctx.guild, channel, reason="play_prefix")
+        if not vc:
+            await ctx.send(voice_error_message(error_code))
+            return
+
     queue = get_guild_queue(ctx.guild.id)
     if vc and vc.channel:
         last_voice_channel_id[ctx.guild.id] = vc.channel.id
+
     added_titles: List[str] = []
-    # Determine if query is a Spotify link
     if is_spotify_url(query) and SPOTIFY_CLIENT:
-        await ctx.send("🎵 Spotify link felismerve, számok hozzáadása...")
+        await ctx.send("Spotify link felismerve, szamok hozzaadasa...")
         track_terms = await get_spotify_tracks(query)
         if not track_terms:
-            await ctx.send("❌ Nem sikerült beolvasni a Spotify tartalmat vagy üres a lejátszási lista.")
+            await ctx.send("Nem sikerult beolvasni a Spotify tartalmat vagy ures a lejatszasi lista.")
         for term in track_terms:
             res = await search_youtube(term)
             if res:
@@ -543,30 +696,28 @@ async def play(ctx, *, query: str):
                 await queue.put((audio_url, title, ctx))
                 added_titles.append(title)
     else:
-        # treat as a normal query (YouTube URL or search term)
-        await ctx.send(f"🔍 Keresés: {query}")
+        await ctx.send(f"Kereses: {query}")
         res = await search_youtube(query)
         if res:
             audio_url, title = res
             await queue.put((audio_url, title, ctx))
             added_titles.append(title)
         else:
-            await ctx.send("❌ Nem találtam eredményt.")
+            await ctx.send("Nem talaltam eredmenyt.")
             return
-    # Send information about added songs
+
     if added_titles:
         if len(added_titles) == 1:
-            await ctx.send(f"🎶 Hozzáadva: **{added_titles[0]}**")
+            await ctx.send(f"Hozzaadva: **{added_titles[0]}**")
         else:
-            await ctx.send(f"📜 {len(added_titles)} szám hozzáadva a várólistához.")
+            await ctx.send(f"{len(added_titles)} szam hozzaadva a varolistahoz.")
             for t in added_titles[:5]:
-                await ctx.send(f"➕ {t}")
+                await ctx.send(f"+ {t}")
             if len(added_titles) > 5:
-                await ctx.send(f"…és {len(added_titles) - 5} további.")
-    # Start playing if nothing is playing
+                await ctx.send(f"...es {len(added_titles) - 5} tovabbi.")
+
     if vc and not vc.is_playing() and not vc.is_paused():
         await play_next(ctx.guild)
-
 
 async def play_next(guild: discord.Guild):
     """Play the next song in the queue for a guild."""
@@ -574,6 +725,9 @@ async def play_next(guild: discord.Guild):
     async with play_lock:
         vc = await ensure_voice_connection(guild)
         if not vc:
+            current_track.pop(guild.id, None)
+            now_playing.pop(guild.id, None)
+            track_recovery_attempts.pop(guild.id, None)
             return
         if vc.is_playing() or vc.is_paused():
             return
@@ -689,7 +843,7 @@ async def shuffle_cmd(ctx):
 
 
 if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN nincs beállítva a környezetben.")
+    logger.warning("DISCORD_TOKEN nincs beallitva; run_bot inditaskor kotelezo.")
 
 # ---------------------------------------------------------------------------
 # Slash command definitions
@@ -700,21 +854,17 @@ music_group = app_commands.Group(name="zene", description="Zene lejatszo parancs
 
 @music_group.command(name="join", description="Csatlakozik a hangcsatornahoz, ahol a felhasznalo van.")
 async def join_slash(interaction: discord.Interaction):
-    if interaction.user.voice:
-        channel = interaction.user.voice.channel  # type: ignore[assignment]
-        try:
-            if interaction.guild.voice_client is None:
-                await channel.connect(timeout=30, reconnect=True, self_deaf=True)
-            else:
-                await interaction.guild.voice_client.move_to(channel)  # type: ignore[union-attr]
-            last_voice_channel_id[interaction.guild.id] = channel.id
-            await interaction.response.send_message(f"Csatlakoztam a(z) {channel.name} csatornahoz!")
-        except asyncio.TimeoutError:
-            await interaction.response.send_message("Nem sikerult csatlakozni a voice csatornahoz: timeout.")
-        except Exception as e:
-            await interaction.response.send_message(f"Hiba tortent a csatlakozas soran: {e}")
-    else:
+    if not interaction.user.voice:
         await interaction.response.send_message("Elobb csatlakozz egy hangcsatornahoz!")
+        return
+
+    channel = interaction.user.voice.channel  # type: ignore[assignment]
+    vc, error_code = await connect_voice_with_retries(interaction.guild, channel, reason="join_slash")
+    if not vc:
+        await interaction.response.send_message(voice_error_message(error_code))
+        return
+
+    await interaction.response.send_message(f"Csatlakoztam a(z) {channel.name} csatornahoz!")
 
 
 @music_group.command(name="leave", description="Kilep a hangcsatornabol, amiben a bot van.")
@@ -735,22 +885,16 @@ async def play_slash(interaction: discord.Interaction, query: str):
     vc = interaction.guild.voice_client
     if vc and vc.channel:
         last_voice_channel_id[interaction.guild.id] = vc.channel.id
+
     if not vc:
-        if interaction.user.voice:
-            channel = interaction.user.voice.channel  # type: ignore[assignment]
-            try:
-                await channel.connect(timeout=30, reconnect=True, self_deaf=True)
-            except asyncio.TimeoutError:
-                await interaction.followup.send("Nem sikerult csatlakozni a voice csatornahoz: timeout.")
-                return
-            except Exception as e:
-                await interaction.followup.send(f"Hiba tortent a csatlakozas soran: {e}")
-                return
-            vc = interaction.guild.voice_client
-            if vc and vc.channel:
-                last_voice_channel_id[interaction.guild.id] = vc.channel.id
-        else:
+        if not interaction.user.voice:
             await interaction.followup.send("Elobb csatlakozz egy hangcsatornahoz!")
+            return
+
+        channel = interaction.user.voice.channel  # type: ignore[assignment]
+        vc, error_code = await connect_voice_with_retries(interaction.guild, channel, reason="play_slash")
+        if not vc:
+            await interaction.followup.send(voice_error_message(error_code))
             return
 
     queue = get_guild_queue(interaction.guild.id)
@@ -884,6 +1028,16 @@ async def shuffle_slash(interaction: discord.Interaction):
 
 bot.tree.add_command(music_group)
 
-# Start the bot after registering all commands
-bot.run(TOKEN)
+
+def run_bot() -> None:
+    """Entrypoint for starting the Discord bot."""
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN nincs beallitva a kornyezetben.")
+    bot.run(TOKEN)
+
+
+if __name__ == "__main__":
+    run_bot()
+
+
 
