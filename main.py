@@ -94,8 +94,10 @@ MAX_TRACK_RECOVERY_ATTEMPTS = 2
 autocomplete_cache: dict[str, Tuple[float, List[str]]] = {}
 AUTOCOMPLETE_CACHE_TTL_SECONDS = 30.0
 autocomplete_inflight: dict[str, asyncio.Task] = {}
+intentional_voice_disconnect_until: dict[int, float] = {}
 VOICE_CONNECT_TIMEOUT_CODE = "VOICE_CONNECT_TIMEOUT"
 VOICE_CONNECT_UNSTABLE_CODE = "VOICE_CONNECT_UNSTABLE"
+VOICE_INTENTIONAL_DISCONNECT_GRACE_SEC = 15.0
 
 
 def find_ffmpeg_executable() -> Optional[str]:
@@ -170,13 +172,29 @@ def log_voice_event(
     logger.log(level, "VOICE_EVENT %s", " ".join(fields))
 
 
+def mark_intentional_voice_disconnect(guild_id: int, grace_seconds: float = VOICE_INTENTIONAL_DISCONNECT_GRACE_SEC) -> None:
+    """Suppress automatic reconnect briefly after manual/expected disconnects."""
+    intentional_voice_disconnect_until[guild_id] = time.monotonic() + max(grace_seconds, 1.0)
+
+
+def is_intentional_voice_disconnect_active(guild_id: int) -> bool:
+    """Return True while reconnect suppression window is active."""
+    until = intentional_voice_disconnect_until.get(guild_id)
+    if not until:
+        return False
+    if time.monotonic() < until:
+        return True
+    intentional_voice_disconnect_until.pop(guild_id, None)
+    return False
+
+
 def voice_error_message(error_code: str) -> str:
     """Translate internal voice error codes to user-facing messages."""
     if error_code == VOICE_CONNECT_TIMEOUT_CODE:
-        return "Nem sikerult csatlakozni a voice csatornahoz (hiba: VOICE_CONNECT_TIMEOUT)."
+        return "Nem sikerült csatlakozni a voice csatornához (hiba: VOICE_CONNECT_TIMEOUT)."
     if error_code == VOICE_CONNECT_UNSTABLE_CODE:
         return "A voice kapcsolat instabil (hiba: VOICE_CONNECT_UNSTABLE)."
-    return "Nem sikerult csatlakozni a voice csatornahoz."
+    return "Nem sikerült csatlakozni a voice csatornához."
 
 
 async def connect_voice_with_retries(
@@ -562,6 +580,8 @@ async def safe_send(target: object, message: str):
 
 async def ensure_voice_connection(guild: discord.Guild, target: Optional[object] = None) -> Optional[discord.VoiceClient]:
     """Ensure active voice connection, attempting reconnect to last known channel."""
+    if is_intentional_voice_disconnect_active(guild.id):
+        return None
     vc = guild.voice_client
     if vc and vc.is_connected():
         if vc.channel:
@@ -575,7 +595,7 @@ async def ensure_voice_connection(guild: discord.Guild, target: Optional[object]
 
     vc, error_code = await connect_voice_with_retries(guild, channel, reason="recovery")
     if vc and target:
-        await safe_send(target, "Kapcsolat megszakadt, ujracsatlakoztam a voice csatornahoz.")
+        await safe_send(target, "🔁 Kapcsolat megszakadt, újracsatlakoztam a voice csatornához.")
     if not vc:
         log_voice_event("recovery_failed", guild.id, channel_id=channel_id, level=logging.WARNING)
     return vc
@@ -618,7 +638,7 @@ async def start_track(guild: discord.Guild, url: str, title: str, target: object
     now_playing[guild.id] = title
     current_track[guild.id] = (url, title, target)
     if announce:
-        await safe_send(target, f"Most jatszom: **{title}**")
+        await safe_send(target, f"🎶 Most játszom: **{title}**")
     return True
 
 
@@ -644,6 +664,8 @@ async def handle_track_end(guild: discord.Guild, error: Optional[Exception]):
 async def retry_play_next_later(guild: discord.Guild, delay_seconds: float = 2.0):
     """Retry queue playback later to avoid stalling on transient start failures."""
     await asyncio.sleep(delay_seconds)
+    if is_intentional_voice_disconnect_active(guild.id):
+        return
     await play_next(guild)
 
 
@@ -664,7 +686,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
                 await bot.tree.sync()
             except Exception as sync_err:
                 logger.warning("Automatikus slash re-sync sikertelen error=%s", sync_err)
-        msg = "A slash parancsok frissulnek. Probald ujra par masodperc mulva."
+        msg = "A slash parancsok frissülnek. Próbáld újra pár másodperc múlva."
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
@@ -683,6 +705,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         last_voice_channel_id[guild.id] = after.channel.id
         return
     if before.channel and after.channel is None:
+        if is_intentional_voice_disconnect_active(guild.id):
+            log_voice_event("intentional_disconnect_skip_recovery", guild.id, channel_id=before.channel.id)
+            return
         queue = get_guild_queue(guild.id)
         # If playback/queue exists, reconnect and continue automatically.
         if guild.id in current_track or not queue.empty():
@@ -703,7 +728,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 async def join(ctx):
     """Join the voice channel that the user is currently in."""
     if not ctx.author.voice:
-        await ctx.send("Elobb csatlakozz egy hangcsatornahoz!")
+        await ctx.send("❗ Előbb csatlakozz egy hangcsatornához!")
         return
 
     channel = ctx.author.voice.channel
@@ -712,17 +737,31 @@ async def join(ctx):
         await ctx.send(voice_error_message(error_code))
         return
 
-    await ctx.send(f"Csatlakoztam a(z) {channel.name} csatornahoz!")
+    await ctx.send(f"✅ Csatlakoztam a(z) **{channel.name}** csatornához!")
 
 
 @bot.command(name='leave')
 async def leave(ctx):
     """Disconnect from the current voice channel."""
     if ctx.voice_client:
-        await ctx.voice_client.disconnect()
+        guild_id = ctx.guild.id
+        mark_intentional_voice_disconnect(guild_id)
+        queue = get_guild_queue(guild_id)
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+            ctx.voice_client.stop()
+        now_playing.pop(guild_id, None)
+        current_track.pop(guild_id, None)
+        track_recovery_attempts.pop(guild_id, None)
+        last_voice_channel_id.pop(guild_id, None)
+        await ctx.voice_client.disconnect(force=True)
         await ctx.send("👋 Kiléptem a voice csatornából.")
     else:
-        await ctx.send("Nem vagyok voice csatornában.")
+        await ctx.send("ℹ️ Nem vagyok voice csatornában.")
 
 
 @bot.command(name='play')
@@ -731,7 +770,7 @@ async def play(ctx, *, query: str):
     vc = ctx.voice_client
     if not vc:
         if not ctx.author.voice:
-            await ctx.send("Elobb csatlakozz egy hangcsatornahoz!")
+            await ctx.send("❗ Előbb csatlakozz egy hangcsatornához!")
             return
         channel = ctx.author.voice.channel
         vc, error_code = await connect_voice_with_retries(ctx.guild, channel, reason="play_prefix")
@@ -745,10 +784,10 @@ async def play(ctx, *, query: str):
 
     added_titles: List[str] = []
     if is_spotify_url(query) and SPOTIFY_CLIENT:
-        await ctx.send("Spotify link felismerve, szamok hozzaadasa...")
+        await ctx.send("🎧 Spotify link felismerve, számok hozzáadása...")
         track_terms = await get_spotify_tracks(query)
         if not track_terms:
-            await ctx.send("Nem sikerult beolvasni a Spotify tartalmat vagy ures a lejatszasi lista.")
+            await ctx.send("❌ Nem sikerült beolvasni a Spotify tartalmat, vagy üres a lejátszási lista.")
         for term in track_terms:
             res = await search_youtube(term)
             if res:
@@ -756,25 +795,25 @@ async def play(ctx, *, query: str):
                 await queue.put((audio_url, title, ctx))
                 added_titles.append(title)
     else:
-        await ctx.send(f"Kereses: {query}")
+        await ctx.send(f"🔎 Keresés: {query}")
         res = await search_youtube(query)
         if res:
             audio_url, title = res
             await queue.put((audio_url, title, ctx))
             added_titles.append(title)
         else:
-            await ctx.send("Nem talaltam eredmenyt.")
+            await ctx.send("❌ Nem találtam eredményt.")
             return
 
     if added_titles:
         if len(added_titles) == 1:
-            await ctx.send(f"Hozzaadva: **{added_titles[0]}**")
+            await ctx.send(f"✅ Hozzáadva: **{added_titles[0]}**")
         else:
-            await ctx.send(f"{len(added_titles)} szam hozzaadva a varolistahoz.")
+            await ctx.send(f"✅ {len(added_titles)} szám hozzáadva a várólistához.")
             for t in added_titles[:5]:
                 await ctx.send(f"+ {t}")
             if len(added_titles) > 5:
-                await ctx.send(f"...es {len(added_titles) - 5} tovabbi.")
+                await ctx.send(f"...és {len(added_titles) - 5} további.")
 
     if vc and not vc.is_playing() and not vc.is_paused():
         await play_next(ctx.guild)
@@ -783,6 +822,18 @@ async def play_next(guild: discord.Guild):
     """Play the next song in the queue for a guild."""
     play_lock = get_playback_lock(guild.id)
     async with play_lock:
+        if is_intentional_voice_disconnect_active(guild.id):
+            return
+        queue = get_guild_queue(guild.id)
+        if queue.empty():
+            vc = guild.voice_client
+            if vc and (vc.is_connected() or vc.is_playing() or vc.is_paused()):
+                mark_intentional_voice_disconnect(guild.id)
+                await vc.disconnect(force=True)
+            current_track.pop(guild.id, None)
+            now_playing.pop(guild.id, None)
+            track_recovery_attempts.pop(guild.id, None)
+            return
         vc = await ensure_voice_connection(guild)
         if not vc:
             current_track.pop(guild.id, None)
@@ -791,14 +842,14 @@ async def play_next(guild: discord.Guild):
             return
         if vc.is_playing() or vc.is_paused():
             return
-        queue = get_guild_queue(guild.id)
-        if queue.empty():
-            await vc.disconnect()
-            return
         try:
             url, title, target = queue.get_nowait()
         except asyncio.QueueEmpty:
-            await vc.disconnect()
+            mark_intentional_voice_disconnect(guild.id)
+            current_track.pop(guild.id, None)
+            now_playing.pop(guild.id, None)
+            track_recovery_attempts.pop(guild.id, None)
+            await vc.disconnect(force=True)
             return
         ok = await start_track(guild, url, title, target)
         if not ok:
@@ -813,7 +864,7 @@ async def skip(ctx):
         ctx.voice_client.stop()
         await ctx.send("⏭️ Kihagyva az aktuális számot.")
     else:
-        await ctx.send("Nem játszik semmi.")
+        await ctx.send("ℹ️ Nem játszik semmi.")
 
 
 @bot.command(name='pause')
@@ -823,7 +874,7 @@ async def pause(ctx):
         ctx.voice_client.pause()
         await ctx.send("⏸️ Lejátszás szüneteltetve.")
     else:
-        await ctx.send("Nem játszik semmi.")
+        await ctx.send("ℹ️ Nem játszik semmi.")
 
 
 @bot.command(name='resume')
@@ -833,7 +884,7 @@ async def resume(ctx):
         ctx.voice_client.resume()
         await ctx.send("▶️ Lejátszás folytatva.")
     else:
-        await ctx.send("Nem volt szüneteltetve.")
+        await ctx.send("ℹ️ Nem volt szüneteltetve.")
 
 
 @bot.command(name='np')
@@ -843,7 +894,7 @@ async def nowplaying(ctx):
     if title:
         await ctx.send(f"🎶 Most játszom: **{title}**")
     else:
-        await ctx.send("Nem játszik semmi.")
+        await ctx.send("ℹ️ Nem játszik semmi.")
 
 
 @bot.command(name='queue')
@@ -851,7 +902,7 @@ async def queue_cmd(ctx):
     """Display the upcoming songs in the queue."""
     queue = get_guild_queue(ctx.guild.id)
     if queue.empty():
-        await ctx.send("A várólista üres.")
+        await ctx.send("ℹ️ A várólista üres.")
         return
     # list items without removing them
     items = list(queue._queue)  # type: ignore[attr-defined]
@@ -888,7 +939,7 @@ async def shuffle_cmd(ctx):
     """Shuffle the current queue."""
     queue = get_guild_queue(ctx.guild.id)
     if queue.empty():
-        await ctx.send("A várólista üres, nincs mit keverni.")
+        await ctx.send("ℹ️ A várólista üres, nincs mit keverni.")
         return
     # Extract all items
     items = []
@@ -909,13 +960,13 @@ if not TOKEN:
 # Slash command definitions
 # ---------------------------------------------------------------------------
 
-music_group = app_commands.Group(name="zene", description="Zene lejatszo parancsok")
+music_group = app_commands.Group(name="zene", description="Zenelejátszó parancsok")
 
 
-@music_group.command(name="join", description="Csatlakozik a hangcsatornahoz, ahol a felhasznalo van.")
+@music_group.command(name="join", description="Csatlakozik ahhoz a hangcsatornához, ahol a felhasználó van.")
 async def join_slash(interaction: discord.Interaction):
     if not interaction.user.voice:
-        await interaction.response.send_message("Elobb csatlakozz egy hangcsatornahoz!")
+        await interaction.response.send_message("❗ Előbb csatlakozz egy hangcsatornához!")
         return
 
     channel = interaction.user.voice.channel  # type: ignore[assignment]
@@ -924,21 +975,35 @@ async def join_slash(interaction: discord.Interaction):
         await interaction.response.send_message(voice_error_message(error_code))
         return
 
-    await interaction.response.send_message(f"Csatlakoztam a(z) {channel.name} csatornahoz!")
+    await interaction.response.send_message(f"✅ Csatlakoztam a(z) **{channel.name}** csatornához!")
 
 
-@music_group.command(name="leave", description="Kilep a hangcsatornabol, amiben a bot van.")
+@music_group.command(name="leave", description="Kilép abból a hangcsatornából, amiben a bot van.")
 async def leave_slash(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc:
-        await vc.disconnect()
-        await interaction.response.send_message("Kileptem a voice csatornabol.")
+        guild_id = interaction.guild.id
+        mark_intentional_voice_disconnect(guild_id)
+        queue = get_guild_queue(guild_id)
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        now_playing.pop(guild_id, None)
+        current_track.pop(guild_id, None)
+        track_recovery_attempts.pop(guild_id, None)
+        last_voice_channel_id.pop(guild_id, None)
+        await vc.disconnect(force=True)
+        await interaction.response.send_message("👋 Kiléptem a voice csatornából.")
     else:
-        await interaction.response.send_message("Nem vagyok voice csatornaban.")
+        await interaction.response.send_message("ℹ️ Nem vagyok voice csatornában.")
 
 
-@music_group.command(name="play", description="Lejatszik egy dalt YouTube-rol vagy Spotify hivatkozasrol.")
-@app_commands.describe(query="Dal cime, YouTube vagy Spotify URL")
+@music_group.command(name="play", description="Lejátszik egy dalt YouTube-ról vagy Spotify hivatkozásról.")
+@app_commands.describe(query="Dal címe, YouTube vagy Spotify URL")
 @app_commands.autocomplete(query=yt_autocomplete)
 async def play_slash(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
@@ -948,7 +1013,7 @@ async def play_slash(interaction: discord.Interaction, query: str):
 
     if not vc:
         if not interaction.user.voice:
-            await interaction.followup.send("Elobb csatlakozz egy hangcsatornahoz!")
+            await interaction.followup.send("❗ Előbb csatlakozz egy hangcsatornához!")
             return
 
         channel = interaction.user.voice.channel  # type: ignore[assignment]
@@ -961,10 +1026,10 @@ async def play_slash(interaction: discord.Interaction, query: str):
     added_titles: List[str] = []
 
     if is_spotify_url(query) and SPOTIFY_CLIENT:
-        await interaction.followup.send("Spotify link felismerve, szamok hozzaadasa...")
+        await interaction.followup.send("🎧 Spotify link felismerve, számok hozzáadása...")
         track_terms = await get_spotify_tracks(query)
         if not track_terms:
-            await interaction.followup.send("Nem sikerult beolvasni a Spotify tartalmat vagy ures a lejatszasi lista.")
+            await interaction.followup.send("❌ Nem sikerült beolvasni a Spotify tartalmat, vagy üres a lejátszási lista.")
         for term in track_terms:
             res = await search_youtube(term)
             if res:
@@ -972,87 +1037,87 @@ async def play_slash(interaction: discord.Interaction, query: str):
                 await queue.put((audio_url, title, interaction))
                 added_titles.append(title)
     else:
-        await interaction.followup.send(f"Kereses: {query}")
+        await interaction.followup.send(f"🔎 Keresés: {query}")
         res = await search_youtube(query)
         if res:
             audio_url, title = res
             await queue.put((audio_url, title, interaction))
             added_titles.append(title)
         else:
-            await interaction.followup.send("Nem talaltam eredmenyt.")
+            await interaction.followup.send("❌ Nem találtam eredményt.")
             return
 
     if added_titles:
         if len(added_titles) == 1:
-            await interaction.followup.send(f"Hozzaadva: **{added_titles[0]}**")
+            await interaction.followup.send(f"✅ Hozzáadva: **{added_titles[0]}**")
         else:
-            await interaction.followup.send(f"{len(added_titles)} szam hozzaadva a varolistahoz.")
+            await interaction.followup.send(f"✅ {len(added_titles)} szám hozzáadva a várólistához.")
             for t in added_titles[:5]:
                 await interaction.followup.send(f"+ {t}")
             if len(added_titles) > 5:
-                await interaction.followup.send(f"...es {len(added_titles) - 5} tovabbi.")
+                await interaction.followup.send(f"...és {len(added_titles) - 5} további.")
 
     if vc and not vc.is_playing() and not vc.is_paused():
         await play_next(interaction.guild)
 
 
-@music_group.command(name="skip", description="Kihagyja az aktualisan jatszott szamot.")
+@music_group.command(name="skip", description="Kihagyja az aktuálisan játszott számot.")
 async def skip_slash(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
         vc.stop()
-        await interaction.response.send_message("Kihagyva az aktualis szamot.")
+        await interaction.response.send_message("⏭️ Kihagyva az aktuális számot.")
     else:
-        await interaction.response.send_message("Nem jatszik semmi.")
+        await interaction.response.send_message("ℹ️ Nem játszik semmi.")
 
 
-@music_group.command(name="pause", description="Szunetelteti az aktualis lejatszast.")
+@music_group.command(name="pause", description="Szünetelteti az aktuális lejátszást.")
 async def pause_slash(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
-        await interaction.response.send_message("Lejatszas szuneteltetve.")
+        await interaction.response.send_message("⏸️ Lejátszás szüneteltetve.")
     else:
-        await interaction.response.send_message("Nem jatszik semmi.")
+        await interaction.response.send_message("ℹ️ Nem játszik semmi.")
 
 
-@music_group.command(name="resume", description="Folytatja a szuneteltetett lejatszast.")
+@music_group.command(name="resume", description="Folytatja a szüneteltetett lejátszást.")
 async def resume_slash(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
-        await interaction.response.send_message("Lejatszas folytatva.")
+        await interaction.response.send_message("▶️ Lejátszás folytatva.")
     else:
-        await interaction.response.send_message("Nem volt szuneteltetve.")
+        await interaction.response.send_message("ℹ️ Nem volt szüneteltetve.")
 
 
-@music_group.command(name="np", description="Megjeleniti az aktualis szamot.")
+@music_group.command(name="np", description="Megjeleníti az aktuális számot.")
 async def now_playing_slash(interaction: discord.Interaction):
     title = now_playing.get(interaction.guild.id)
     if title:
-        await interaction.response.send_message(f"Most jatszom: **{title}**")
+        await interaction.response.send_message(f"🎶 Most játszom: **{title}**")
     else:
-        await interaction.response.send_message("Nem jatszik semmi.")
+        await interaction.response.send_message("ℹ️ Nem játszik semmi.")
 
 
-@music_group.command(name="queue", description="Megjeleniti a varolistaban levo szamokat.")
+@music_group.command(name="queue", description="Megjeleníti a várólistában lévő számokat.")
 async def queue_slash(interaction: discord.Interaction):
     q = get_guild_queue(interaction.guild.id)
     if q.empty():
-        await interaction.response.send_message("A varolista ures.")
+        await interaction.response.send_message("ℹ️ A várólista üres.")
         return
 
     items: Iterable[Tuple[str, str, object]] = list(q._queue)  # type: ignore[attr-defined]
-    lines = [f"Varolista ({len(items)} szam):"]
+    lines = [f"📋 Várólista ({len(items)} szám):"]
     for idx, (_, title, _) in enumerate(items, start=1):
         if idx > 10:
-            lines.append(f"...es meg {len(items) - 10} tovabbi.")
+            lines.append(f"...és még {len(items) - 10} további.")
             break
         lines.append(f"{idx}. {title}")
     await interaction.response.send_message("\n".join(lines))
 
 
-@music_group.command(name="stop", description="Leallitja a lejatszast es torli a varolistat.")
+@music_group.command(name="stop", description="Leállítja a lejátszást és törli a várólistát.")
 async def stop_slash(interaction: discord.Interaction):
     q = get_guild_queue(interaction.guild.id)
     while not q.empty():
@@ -1067,14 +1132,14 @@ async def stop_slash(interaction: discord.Interaction):
     now_playing.pop(interaction.guild.id, None)
     current_track.pop(interaction.guild.id, None)
     track_recovery_attempts.pop(interaction.guild.id, None)
-    await interaction.response.send_message("Lejatszas leallitva es varolista torolve.")
+    await interaction.response.send_message("⏹️ Lejátszás leállítva és várólista törölve.")
 
 
-@music_group.command(name="shuffle", description="Megkeveri a varolistat.")
+@music_group.command(name="shuffle", description="Megkeveri a várólistát.")
 async def shuffle_slash(interaction: discord.Interaction):
     q = get_guild_queue(interaction.guild.id)
     if q.empty():
-        await interaction.response.send_message("A varolista ures, nincs mit keverni.")
+        await interaction.response.send_message("ℹ️ A várólista üres, nincs mit keverni.")
         return
 
     items = []
@@ -1083,7 +1148,7 @@ async def shuffle_slash(interaction: discord.Interaction):
     random.shuffle(items)
     for item in items:
         await q.put(item)
-    await interaction.response.send_message("A varolista megkeverve.")
+    await interaction.response.send_message("🔀 A várólista megkeverve.")
 
 
 bot.tree.add_command(music_group)
