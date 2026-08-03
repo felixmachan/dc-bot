@@ -278,3 +278,67 @@ def test_info_embed_covers_every_command_and_button():
     # Discord's own limits.
     assert len(embed) <= 6000
     assert all(len(f.value) <= 1024 and len(f.name) <= 256 for f in embed.fields)
+
+
+def test_empty_search_is_retried_with_a_music_context_word():
+    """YouTube's adult filter answers 'xxx' queries with nothing; a retry gets past it."""
+    FakeYDL.outcomes = [
+        {"entries": []},                                        # first attempt filtered away
+        {"entries": [flat_entry("v1", "T. Danny - xXx (Official Music Video)")]},
+    ]
+
+    results = asyncio.run(main.search_youtube("t danny xxx"))
+
+    assert [r.title for r in results] == ["T. Danny - xXx (Official Music Video)"]
+    assert FakeYDL.calls == [
+        f"ytsearch{main.SEARCH_CANDIDATES}:t danny xxx",
+        f"ytsearch{main.SEARCH_CANDIDATES}:t danny xxx {main.SEARCH_RETRY_SUFFIX}",
+    ]
+
+
+def test_retry_scores_against_the_original_query():
+    """The filler word must not count towards the match score."""
+    FakeYDL.outcomes = [
+        {"entries": []},
+        {"entries": [flat_entry("v1", "T. Danny - xXx (Official Music Video)")]},
+    ]
+
+    results = asyncio.run(main.search_youtube("t danny xxx"))
+
+    # t, danny, xxx all appear in the title -> a genuine 1.0, not one inflated
+    # by the retry's own word.
+    assert results[0].score == 1.0
+    assert results[0].score >= main.SEARCH_CONFIDENT_SCORE
+
+
+def test_retry_does_not_inflate_a_poor_match():
+    FakeYDL.outcomes = [
+        {"entries": []},
+        {"entries": [flat_entry("v1", "Valami egeszen mas music")]},
+    ]
+
+    results = asyncio.run(main.search_youtube("t danny xxx"))
+
+    assert results[0].score < main.SEARCH_CONFIDENT_SCORE, "should still ask the user"
+
+
+def test_no_retry_when_the_first_search_already_found_something():
+    FakeYDL.outcomes = [{"entries": [flat_entry("v1", "Rendes talalat")]}]
+
+    asyncio.run(main.search_youtube("rendes talalat"))
+
+    assert len(FakeYDL.calls) == 1, "a working search must not cost a second request"
+
+
+def test_no_retry_when_the_search_itself_errored():
+    FakeYDL.outcomes = [RuntimeError("network down")]
+
+    assert asyncio.run(main.search_youtube("barmi")) == []
+    assert len(FakeYDL.calls) == 1, "an outage is not a filtered query"
+
+
+def test_both_searches_empty_gives_up():
+    FakeYDL.outcomes = [{"entries": []}, {"entries": []}]
+
+    assert asyncio.run(main.search_youtube("tenyleg nincs ilyen")) == []
+    assert len(FakeYDL.calls) == 2

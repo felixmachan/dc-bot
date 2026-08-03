@@ -70,6 +70,8 @@ VOICE_RETRY_BACKOFF_SEC = parse_int_env("VOICE_RETRY_BACKOFF_SEC", 2, minimum=1)
 SEARCH_TIMEOUT_SEC = parse_int_env("SEARCH_TIMEOUT_SEC", 20, minimum=5)
 SEARCH_CANDIDATES = parse_int_env("SEARCH_CANDIDATES", 5, minimum=1)
 YOUTUBE_PLAYLIST_LIMIT = parse_int_env("YOUTUBE_PLAYLIST_LIMIT", 50, minimum=1)
+# Appended and retried when a search comes back completely empty; see search_youtube.
+SEARCH_RETRY_SUFFIX = os.getenv("SEARCH_RETRY_SUFFIX", "music")
 # Empty by default: yt-dlp's own client selection is measurably the most reliable
 # and the fastest, and it keeps adapting as YouTube changes. Pinning clients here
 # (the previous 'android,web') only ever pins us to whatever breaks next, so this
@@ -665,16 +667,10 @@ def match_score(query: str, title: str) -> float:
     return matched / len(tokens)
 
 
-async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List["SearchResult"]:
-    """Return up to `limit` candidates for a search term, best match first.
-
-    This deliberately uses a flat search: it is one cheap request and it never
-    fails just because the top hit happens to be region blocked, age gated or a
-    live stream. Picking a usable candidate is left to resolve_stream_url.
-    """
-    if is_url(term):
-        return [SearchResult(url=term, title=term, score=1.0)]
-
+async def _search_once(
+    query: str, score_against: str, limit: int
+) -> Optional[List["SearchResult"]]:
+    """Run one flat search. None means the search itself failed, [] means no hits."""
     search_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -685,16 +681,16 @@ async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List["Sea
 
     def _search() -> object:
         with yt_dlp.YoutubeDL(search_opts) as ydl:
-            return ydl.extract_info(f"ytsearch{limit}:{term}", download=False)
+            return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
 
     try:
         info = await asyncio.wait_for(asyncio.to_thread(_search), timeout=SEARCH_TIMEOUT_SEC)
     except asyncio.TimeoutError:
-        logger.warning("yt-dlp search timeout term=%r timeout=%ds", term, SEARCH_TIMEOUT_SEC)
-        return []
+        logger.warning("yt-dlp search timeout term=%r timeout=%ds", query, SEARCH_TIMEOUT_SEC)
+        return None
     except Exception as e:
-        logger.error("yt-dlp search error term=%r error=%s", term, e)
-        return []
+        logger.error("yt-dlp search error term=%r error=%s", query, e)
+        return None
 
     candidates: List[SearchResult] = []
     for entry in (info or {}).get('entries', []) or []:
@@ -713,8 +709,36 @@ async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List["Sea
             duration=entry.get('duration'),
             uploader=entry.get('uploader') or entry.get('channel'),
             is_live=is_live_entry(entry),
-            score=match_score(term, title),
+            # Always scored against what the user actually typed, never against a
+            # retry variant, or the retry's filler word would inflate the score.
+            score=match_score(score_against, title),
         ))
+    return candidates
+
+
+async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List["SearchResult"]:
+    """Return up to `limit` candidates for a search term, best match first.
+
+    This deliberately uses a flat search: it is one cheap request and it never
+    fails just because the top hit happens to be region blocked, age gated or a
+    live stream. Picking a usable candidate is left to resolve_stream_url.
+    """
+    if is_url(term):
+        return [SearchResult(url=term, title=term, score=1.0)]
+
+    candidates = await _search_once(term, term, limit)
+    if candidates is None:
+        return []
+
+    if not candidates:
+        # YouTube's adult-content filter answers some perfectly ordinary music
+        # queries with zero results - anything containing a bare "xxx", for
+        # instance, which is a real song title. A music context word gets the
+        # same query past the filter, so retry once before giving up.
+        retried = await _search_once(f"{term} {SEARCH_RETRY_SUFFIX}", term, limit)
+        if retried:
+            logger.info("search rescued by %r suffix term=%r", SEARCH_RETRY_SUFFIX, term)
+            candidates = retried
 
     # Stable sort keeps YouTube's own relevance order among equally good matches,
     # while pushing 24/7 streams behind real uploads and promoting titles that
