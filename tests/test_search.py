@@ -256,12 +256,20 @@ def test_resolve_track_reuses_cached_candidates_without_researching():
     assert FakeYDL.calls == ["https://www.youtube.com/watch?v=ccc"]
 
 
+def test_info_embed_uses_the_registered_group_name():
+    """The help must name the group that actually exists (it is 'zene', not 'music')."""
+    blob = " ".join(f.value for f in main.build_info_embed().fields)
+
+    assert f"/{main.music_group.name} play" in blob
+    assert "/music " not in blob, "hard-coded group name would drift from reality"
+
+
 def test_info_embed_covers_every_command_and_button():
     embed = main.build_info_embed()
     blob = embed.description + " ".join(f"{f.name} {f.value}" for f in embed.fields)
 
     for command in ["play", "skip", "pause", "resume", "queue", "shuffle", "stop", "join", "leave", "np"]:
-        assert f"/music {command}" in blob or f"`{main.PREFIX}{command}" in blob, command
+        assert f"/{main.music_group.name} {command}" in blob or f"`{main.PREFIX}{command}" in blob, command
     for button in ["Pause/Resume", "Skip", "Stop", "Shuffle", "Queue"]:
         assert button in blob, button
     # The picker is explained too.

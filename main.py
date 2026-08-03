@@ -1003,11 +1003,14 @@ class PlayerView(discord.ui.View):
 
 
 def build_info_embed() -> discord.Embed:
-    """Full command and button reference, with the guild's actual prefix filled in."""
+    """Full command and button reference, with the real prefix and group name filled in."""
+    # Read the group name off the command itself so the help can never drift from
+    # what is actually registered.
+    group = music_group.name
     embed = discord.Embed(
         title="🎧 musicBOT — súgó",
         description=(
-            "Minden parancs kétféleképp is megy: **`/music <parancs>`** vagy "
+            f"Minden parancs kétféleképp is megy: **`/{group} <parancs>`** vagy "
             f"prefixszel **`{PREFIX}<parancs>`**.\n"
             "Lejátszáshoz előbb lépj be egy hangcsatornába."
         ),
@@ -1017,7 +1020,7 @@ def build_info_embed() -> discord.Embed:
     embed.add_field(
         name="▶️ Lejátszás",
         value=(
-            f"**`/music play <szám>`** • `{PREFIX}play <szám>`\n"
+            f"**`/{group} play <szám>`** • `{PREFIX}play <szám>`\n"
             "Keres és lejátszik. Megy a szám címe, egy YouTube link, vagy egy "
             "**Spotify szám/album** linkje is.\n"
             "Ha már szól valami, a várólista végére kerül.\n"
@@ -1029,27 +1032,27 @@ def build_info_embed() -> discord.Embed:
     embed.add_field(
         name="⏯️ Vezérlés",
         value=(
-            f"**`/music pause`** • `{PREFIX}pause` — szünet\n"
-            f"**`/music resume`** • `{PREFIX}resume` — folytatás\n"
-            f"**`/music skip`** • `{PREFIX}skip` — következő szám\n"
-            f"**`/music stop`** • `{PREFIX}stop` — leállítás és a várólista törlése"
+            f"**`/{group} pause`** • `{PREFIX}pause` — szünet\n"
+            f"**`/{group} resume`** • `{PREFIX}resume` — folytatás\n"
+            f"**`/{group} skip`** • `{PREFIX}skip` — következő szám\n"
+            f"**`/{group} stop`** • `{PREFIX}stop` — leállítás és a várólista törlése"
         ),
         inline=False,
     )
     embed.add_field(
         name="📜 Várólista",
         value=(
-            f"**`/music queue`** • `{PREFIX}queue` — mi jön még\n"
-            f"**`/music shuffle`** • `{PREFIX}shuffle` — a várólista megkeverése\n"
-            f"**`/music np`** • `{PREFIX}np` — mi szól most"
+            f"**`/{group} queue`** • `{PREFIX}queue` — mi jön még\n"
+            f"**`/{group} shuffle`** • `{PREFIX}shuffle` — a várólista megkeverése\n"
+            f"**`/{group} np`** • `{PREFIX}np` — mi szól most"
         ),
         inline=False,
     )
     embed.add_field(
         name="🔌 Csatlakozás",
         value=(
-            f"**`/music join`** • `{PREFIX}join` — belép a csatornádba\n"
-            f"**`/music leave`** • `{PREFIX}leave` — kilép és törli a várólistát\n"
+            f"**`/{group} join`** • `{PREFIX}join` — belép a csatornádba\n"
+            f"**`/{group} leave`** • `{PREFIX}leave` — kilép és törli a várólistát\n"
             "A bot magától is belép, ha a `play`-t használod, és kilép, ha elfogy a lista."
         ),
         inline=False,
@@ -1080,7 +1083,9 @@ def build_info_embed() -> discord.Embed:
         ),
         inline=False,
     )
-    embed.set_footer(text="Tipp: a /music play mezőben gépelés közben javaslatokat is kapsz.")
+    embed.set_footer(
+        text=f"Tipp: a /{group} play mezőben gépelés közben javaslatokat is kapsz."
+    )
     return embed
 
 
