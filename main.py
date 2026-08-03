@@ -830,13 +830,14 @@ SPOTIFY_ERROR_MESSAGES = {
     "no_client": "❌ A Spotify támogatás nincs beállítva (hiányzó SPOTIFY_CLIENT_ID/SECRET).",
     "bad_url": "❌ Ezt a Spotify linket nem ismerem fel. Szám, album vagy lejátszási lista linkje kell.",
     "forbidden": (
-        "❌ A Spotify nem engedi ennek a botnak a lejátszási listák tartalmát kiolvasni.\n"
-        "➡️ **Album** és **egy-egy szám** linkje viszont működik, vagy másold be a számok címét."
+        "❌ A Spotify egyetlen lejátszási lista tartalmát sem adja ki ennek a botnak — "
+        "publikusét sem.\n"
+        "➡️ Ami megy: Spotify **album**- és **szám**-link, vagy egy **YouTube lejátszási lista** linkje."
     ),
     "not_found": (
-        "❌ Ezt a lejátszási listát a Spotify nem adja ki a botoknak — az algoritmikus és a "
+        "❌ Ezt a listát a Spotify egyáltalán nem mutatja a botoknak: az algoritmikus és a "
         "Spotify által készített listák (Daily Mix, rádió, Neked készült) le vannak zárva.\n"
-        "➡️ Próbáld egy saját készítésű listával, albummal, vagy szám linkkel."
+        "➡️ Ami megy: Spotify **album**- és **szám**-link, vagy egy **YouTube lejátszási lista** linkje."
     ),
     "empty": "❌ Ez a Spotify tartalom üres.",
     "error": "❌ Nem sikerült beolvasni a Spotify tartalmat.",

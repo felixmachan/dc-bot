@@ -61,7 +61,10 @@ def test_playlist_403_reports_forbidden_not_empty(spotify):
 
     assert tracks == []
     assert error == "forbidden"
-    assert "Album" in main.spotify_error_message(error)
+    message = main.spotify_error_message(error)
+    assert "album" in message.lower()
+    # The advice must point somewhere that actually works.
+    assert "YouTube" in message
 
 
 def test_algorithmic_playlist_404_reports_not_found(spotify):
@@ -72,7 +75,9 @@ def test_algorithmic_playlist_404_reports_not_found(spotify):
     )
 
     assert (tracks, error) == ([], "not_found")
-    assert "Daily Mix" in main.spotify_error_message(error)
+    message = main.spotify_error_message(error)
+    assert "Daily Mix" in message
+    assert "YouTube" in message
 
 
 def test_track_url_resolves_to_a_search_term(spotify):
