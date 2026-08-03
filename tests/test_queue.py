@@ -165,3 +165,97 @@ def test_clear_queue_empties_it():
     main.clear_queue(704)
 
     assert queue.empty()
+
+
+class FakeResponse:
+    def __init__(self):
+        self.edited = None
+        self.sent = None
+
+    async def edit_message(self, **kwargs):
+        self.edited = kwargs
+
+    async def send_message(self, content=None, **kwargs):
+        self.sent = {"content": content, **kwargs}
+
+
+class FakeInteraction:
+    def __init__(self, guild, user_id):
+        self.guild = guild
+        self.user = SimpleNamespace(id=user_id, display_name="tester")
+        self.response = FakeResponse()
+
+
+def chooser_results():
+    return [
+        main.SearchResult(url="https://yt/1", title="Rossz találat"),
+        main.SearchResult(url="https://yt/2", title="Jó találat"),
+        main.SearchResult(url="https://yt/3", title="Harmadik"),
+    ]
+
+
+def test_chooser_has_one_button_per_result_plus_cancel():
+    view = main.TrackChooserView("q", chooser_results(), requester_id=1, target=None)
+
+    assert len(view.children) == 4
+    assert view.children[-1].custom_id == "chooser:cancel"
+    assert view.timeout == main.CHOOSER_TIMEOUT_SEC
+
+
+def test_choosing_queues_that_result_and_keeps_the_others_as_fallbacks(monkeypatch):
+    guild = FakeGuild(710)
+    guild.voice_client = None          # nothing playing, so no play_next call
+    results = chooser_results()
+    view = main.TrackChooserView("q", results, requester_id=1, target="orig-target")
+    interaction = FakeInteraction(guild, user_id=1)
+
+    # children[1] is the second result's button.
+    asyncio.run(view.children[1].callback(interaction))
+
+    queue = main.get_guild_queue(guild.id)
+    assert queue.qsize() == 1
+    track = queue.get_nowait()
+    assert track.title == "Jó találat"
+    assert track.source == "https://yt/2"
+    assert track.target == "orig-target"
+    # The chosen hit leads, the rest stay as fallbacks for a dead video.
+    assert [c.title for c in track.candidates] == ["Jó találat", "Rossz találat", "Harmadik"]
+    assert "Jó találat" in interaction.response.edited["content"]
+    assert interaction.response.edited["view"] is None
+
+
+def test_only_the_requester_may_choose():
+    guild = FakeGuild(711)
+    view = main.TrackChooserView("q", chooser_results(), requester_id=1, target=None)
+    interaction = FakeInteraction(guild, user_id=999)
+
+    asyncio.run(view.children[0].callback(interaction))
+
+    assert main.get_guild_queue(guild.id).empty(), "a stranger must not queue anything"
+    assert "nem te indítottad" in interaction.response.sent["content"]
+    assert interaction.response.sent["ephemeral"] is True
+
+
+def test_cancel_clears_the_prompt_without_queueing():
+    guild = FakeGuild(712)
+    view = main.TrackChooserView("q", chooser_results(), requester_id=1, target=None)
+    interaction = FakeInteraction(guild, user_id=1)
+
+    asyncio.run(view.children[-1].callback(interaction))
+
+    assert main.get_guild_queue(guild.id).empty()
+    assert "Megszakítva" in interaction.response.edited["content"]
+
+
+def test_chooser_embed_lists_every_result_with_length_and_channel():
+    results = [
+        main.SearchResult(url="https://yt/1", title="Első", duration=222, uploader="T. Danny"),
+        main.SearchResult(url="https://yt/2", title="Élő adás", is_live=True),
+    ]
+
+    embed = main.build_chooser_embed("tdanny szivtipro", results)
+
+    assert len(embed.fields) == 2
+    assert "Első" in embed.fields[0].name
+    assert "3:42" in embed.fields[0].value and "T. Danny" in embed.fields[0].value
+    assert "élő" in embed.fields[1].value

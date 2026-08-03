@@ -6,6 +6,7 @@ import glob
 import shutil
 import time
 import logging
+import unicodedata
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
@@ -95,6 +96,19 @@ last_resync_ts: float = 0.0
 
 
 @dataclass
+class SearchResult:
+    """One YouTube search hit, before any media URL has been resolved."""
+
+    url: str
+    title: str
+    duration: Optional[int] = None
+    uploader: Optional[str] = None
+    is_live: bool = False
+    # Fraction of the query's words found in the title; see match_score.
+    score: float = 0.0
+
+
+@dataclass
 class QueuedTrack:
     """One queued song.
 
@@ -108,10 +122,10 @@ class QueuedTrack:
     title: str
     target: object
     attempts: int = 0
-    # Pre-searched (watch_url, title) fallbacks, tried in order at playback time.
-    # Watch URLs do not expire, so caching these is safe; only the media URL is
-    # short lived. Empty means "derive from source on first play".
-    candidates: List[Tuple[str, str]] = field(default_factory=list)
+    # Pre-searched fallbacks, tried in order at playback time. Watch URLs do not
+    # expire, so caching these is safe; only the media URL is short lived. Empty
+    # means "derive from source on first play".
+    candidates: List[SearchResult] = field(default_factory=list)
 
 
 # Per‑guild song queues and currently playing information
@@ -128,6 +142,12 @@ MAX_TRACK_RECOVERY_ATTEMPTS = 2
 MAX_TRACK_START_ATTEMPTS = 3
 # How many search candidates we are willing to fully extract before giving up.
 MAX_RESOLVE_CANDIDATES = 3
+# Minimum match_score for the top hit to be played without asking. Below this the
+# user picks from the results, because something they typed is missing from the
+# title and YouTube's ranking has probably drifted onto the wrong song.
+SEARCH_CONFIDENT_SCORE = 0.75
+# How long the result picker stays clickable.
+CHOOSER_TIMEOUT_SEC = 60.0
 # Last "now playing" controller message per guild, so the old button set can be
 # retired when a new track starts.
 player_messages: dict[int, discord.Message] = {}
@@ -500,15 +520,37 @@ def is_live_entry(entry: dict) -> bool:
     return bool(entry.get('is_live')) or entry.get('live_status') == 'is_live'
 
 
-async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List[Tuple[str, str]]:
-    """Return up to `limit` (watch_url, title) candidates for a search term.
+def fold_text(text: str) -> str:
+    """Lowercase, strip accents and punctuation, so 'SZÍVTIPRÓ' matches 'szivtipro'."""
+    decomposed = unicodedata.normalize('NFKD', text or '')
+    stripped = ''.join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r'[^0-9a-z]+', ' ', stripped.lower()).strip()
+
+
+def match_score(query: str, title: str) -> float:
+    """Fraction of the query's words that appear in the title, 0.0 to 1.0.
+
+    Spaces are ignored on the title side, so a run-together query like 'tdanny'
+    still matches 'T. Danny'. This is what rescues searches where YouTube's own
+    ranking puts the wanted song below unrelated tracks by the same artist.
+    """
+    tokens = fold_text(query).split()
+    if not tokens:
+        return 0.0
+    haystack = fold_text(title).replace(' ', '')
+    matched = sum(1 for token in tokens if token in haystack)
+    return matched / len(tokens)
+
+
+async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List["SearchResult"]:
+    """Return up to `limit` candidates for a search term, best match first.
 
     This deliberately uses a flat search: it is one cheap request and it never
     fails just because the top hit happens to be region blocked, age gated or a
     live stream. Picking a usable candidate is left to resolve_stream_url.
     """
     if is_url(term):
-        return [(term, term)]
+        return [SearchResult(url=term, title=term, score=1.0)]
 
     search_opts = {
         'quiet': True,
@@ -531,7 +573,7 @@ async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List[Tupl
         logger.error("yt-dlp search error term=%r error=%s", term, e)
         return []
 
-    ranked: List[Tuple[bool, str, str]] = []
+    candidates: List[SearchResult] = []
     for entry in (info or {}).get('entries', []) or []:
         if not entry or not is_playable_entry(entry):
             continue
@@ -541,14 +583,22 @@ async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List[Tupl
             watch_url = f"https://www.youtube.com/watch?v={video_id}"
         if not watch_url:
             continue
-        ranked.append((is_live_entry(entry), watch_url, entry.get('title') or 'Ismeretlen'))
+        title = entry.get('title') or 'Ismeretlen'
+        candidates.append(SearchResult(
+            url=watch_url,
+            title=title,
+            duration=entry.get('duration'),
+            uploader=entry.get('uploader') or entry.get('channel'),
+            is_live=is_live_entry(entry),
+            score=match_score(term, title),
+        ))
 
-    # Stable sort keeps YouTube's own relevance order within each group while
-    # pushing 24/7 streams behind real uploads. A search for a song should not
-    # land on a radio stream, but "lofi hip hop radio" must still work when a
-    # stream is all there is.
-    ranked.sort(key=lambda item: item[0])
-    candidates: List[Tuple[str, str]] = [(url, title) for _, url, title in ranked]
+    # Stable sort keeps YouTube's own relevance order among equally good matches,
+    # while pushing 24/7 streams behind real uploads and promoting titles that
+    # actually contain what was typed. A search for a song should not land on a
+    # radio stream, but "lofi hip hop radio" must still work when a stream is all
+    # there is.
+    candidates.sort(key=lambda c: (c.is_live, -c.score))
 
     if not candidates:
         logger.warning("yt-dlp search returned no usable candidate term=%r", term)
@@ -557,7 +607,7 @@ async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List[Tupl
     return candidates
 
 
-async def resolve_stream_url(candidates: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+async def resolve_stream_url(candidates: List[SearchResult]) -> Optional[Tuple[str, str]]:
     """Resolve the first playable candidate to a fresh (stream_url, title).
 
     Called right before playback so the media URL is as young as possible, and it
@@ -584,7 +634,8 @@ async def resolve_stream_url(candidates: List[Tuple[str, str]]) -> Optional[Tupl
     last_error: Optional[str] = None
     # Cap the retries: every failed candidate costs a full extraction round trip,
     # and dead air while we grind through five of them is worse than failing fast.
-    for watch_url, fallback_title in candidates[:MAX_RESOLVE_CANDIDATES]:
+    for candidate in candidates[:MAX_RESOLVE_CANDIDATES]:
+        watch_url = candidate.url
         try:
             info = await asyncio.wait_for(
                 asyncio.to_thread(_extract, watch_url), timeout=SEARCH_TIMEOUT_SEC
@@ -620,11 +671,11 @@ async def resolve_stream_url(candidates: List[Tuple[str, str]]) -> Optional[Tupl
             audio_formats.sort(key=lambda f: f.get('abr') or f.get('asr') or 0, reverse=True)
             audio_url = audio_formats[0]['url']
 
-        return audio_url, entry.get('title') or fallback_title
+        return audio_url, entry.get('title') or candidate.title
 
     logger.error(
         "resolve failed for all %d candidate(s) first=%r last_error=%s",
-        len(candidates), candidates[0][0], last_error,
+        len(candidates), candidates[0].url, last_error,
     )
     return None
 
@@ -634,7 +685,8 @@ async def resolve_track(track: QueuedTrack) -> Optional[Tuple[str, str]]:
     if not track.candidates:
         # Spotify entries and prefix-command URLs arrive without a candidate list.
         track.candidates = (
-            [(track.source, track.title)] if is_url(track.source)
+            [SearchResult(url=track.source, title=track.title, score=1.0)]
+            if is_url(track.source)
             else await search_youtube(track.source)
         )
     return await resolve_stream_url(track.candidates)
@@ -905,6 +957,234 @@ class PlayerView(discord.ui.View):
         )
 
 
+def build_info_embed() -> discord.Embed:
+    """Full command and button reference, with the guild's actual prefix filled in."""
+    embed = discord.Embed(
+        title="🎧 musicBOT — súgó",
+        description=(
+            "Minden parancs kétféleképp is megy: **`/music <parancs>`** vagy "
+            f"prefixszel **`{PREFIX}<parancs>`**.\n"
+            "Lejátszáshoz előbb lépj be egy hangcsatornába."
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="▶️ Lejátszás",
+        value=(
+            f"**`/music play <szám>`** • `{PREFIX}play <szám>`\n"
+            "Keres és lejátszik. Megy a szám címe, egy YouTube link, vagy egy "
+            "Spotify szám/album/lejátszási lista linkje is.\n"
+            "Ha már szól valami, a várólista végére kerül."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="⏯️ Vezérlés",
+        value=(
+            f"**`/music pause`** • `{PREFIX}pause` — szünet\n"
+            f"**`/music resume`** • `{PREFIX}resume` — folytatás\n"
+            f"**`/music skip`** • `{PREFIX}skip` — következő szám\n"
+            f"**`/music stop`** • `{PREFIX}stop` — leállítás és a várólista törlése"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📜 Várólista",
+        value=(
+            f"**`/music queue`** • `{PREFIX}queue` — mi jön még\n"
+            f"**`/music shuffle`** • `{PREFIX}shuffle` — a várólista megkeverése\n"
+            f"**`/music np`** • `{PREFIX}np` — mi szól most"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔌 Csatlakozás",
+        value=(
+            f"**`/music join`** • `{PREFIX}join` — belép a csatornádba\n"
+            f"**`/music leave`** • `{PREFIX}leave` — kilép és törli a várólistát\n"
+            "A bot magától is belép, ha a `play`-t használod, és kilép, ha elfogy a lista."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🎛️ A lejátszó gombjai",
+        value=(
+            "Minden elinduló szám alatt megjelenik a vezérlőpult:\n"
+            "⏯️ **Pause/Resume** — szünet vagy folytatás\n"
+            "⏭️ **Skip** — ugrás a következő számra\n"
+            "⏹️ **Stop** — leállítás és a várólista törlése\n"
+            "🔀 **Shuffle** — a várólista megkeverése\n"
+            "📜 **Queue** — a várólista (csak neked látszik)\n\n"
+            "A gombok csak akkor működnek, ha **ugyanabban a hangcsatornában vagy, "
+            "mint a bot**. Újraindítás után is élnek."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🤔 Ha rákérdez, melyik szám kell",
+        value=(
+            "Ha a találat nem egyértelmű — például elgépelted, vagy a keresett szó "
+            "egyik cím sem tartalmazza —, a bot feldobja az 5 legjobb találatot "
+            "hosszal és csatornával.\n"
+            "Válassz az **1️⃣–5️⃣** gombokkal, vagy **✖️ Mégse**. "
+            f"Csak az választhat, aki a keresést indította, és {int(CHOOSER_TIMEOUT_SEC)} "
+            "másodpercig él a kérdés."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Tipp: a /music play mezőben gépelés közben javaslatokat is kapsz.")
+    return embed
+
+
+def format_duration(seconds: Optional[int]) -> str:
+    """Render a track length as m:ss, or h:mm:ss past an hour."""
+    if not seconds:
+        return "?"
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+NUMBER_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"]
+
+
+def build_chooser_embed(query: str, results: List[SearchResult]) -> discord.Embed:
+    """List the search hits so the user can pick the right one."""
+    embed = discord.Embed(
+        title="🤔 Melyik legyen?",
+        description=f"Nem egyértelmű, mit keresel: **{query}**",
+        color=discord.Color.orange(),
+    )
+    for idx, result in enumerate(results):
+        who = result.uploader or "ismeretlen csatorna"
+        length = "🔴 élő" if result.is_live else format_duration(result.duration)
+        embed.add_field(
+            name=f"{NUMBER_EMOJI[idx]} {result.title[:100]}",
+            value=f"{who} • {length}",
+            inline=False,
+        )
+    embed.set_footer(text=f"Válassz {int(CHOOSER_TIMEOUT_SEC)} másodpercen belül.")
+    return embed
+
+
+class TrackChooserView(discord.ui.View):
+    """Numbered picker shown when the best search hit is not convincing.
+
+    Short lived and tied to one requester, so unlike PlayerView it carries state
+    and is not registered for persistence: after a restart the buttons are dead,
+    which is fine for a 60 second prompt.
+    """
+
+    def __init__(self, query: str, results: List[SearchResult], requester_id: int, target: object):
+        super().__init__(timeout=CHOOSER_TIMEOUT_SEC)
+        self.query = query
+        self.results = results
+        self.requester_id = requester_id
+        self.target = target
+        self.message: Optional[discord.Message] = None
+
+        for idx in range(len(results)):
+            button = discord.ui.Button(
+                emoji=NUMBER_EMOJI[idx],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"chooser:pick:{idx}",
+            )
+            button.callback = self._make_pick_callback(idx)
+            self.add_item(button)
+
+        cancel = discord.ui.Button(
+            emoji="✖️", label="Mégse", style=discord.ButtonStyle.secondary, custom_id="chooser:cancel"
+        )
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+
+    async def _check_requester(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "❗ Ezt a keresést nem te indítottad.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _make_pick_callback(self, index: int):
+        async def callback(interaction: discord.Interaction):
+            if not await self._check_requester(interaction):
+                return
+            chosen = self.results[index]
+            self.stop()
+            await interaction.response.edit_message(
+                content=f"✅ Választva: **{chosen.title}**", embed=None, view=None
+            )
+            # Keep the remaining hits as fallbacks, with the chosen one first, so a
+            # dead video still recovers without asking again.
+            ordered = [chosen] + [r for i, r in enumerate(self.results) if i != index]
+            track = QueuedTrack(
+                source=chosen.url,
+                title=chosen.title,
+                target=self.target,
+                candidates=ordered,
+            )
+            await enqueue_track(interaction.guild, track)
+
+        return callback
+
+    async def _cancel(self, interaction: discord.Interaction):
+        if not await self._check_requester(interaction):
+            return
+        self.stop()
+        await interaction.response.edit_message(content="❌ Megszakítva.", embed=None, view=None)
+
+    async def on_timeout(self) -> None:
+        if not self.message:
+            return
+        try:
+            await self.message.edit(
+                content="⌛ Lejárt a választás ideje.", embed=None, view=None
+            )
+        except Exception as edit_err:
+            logger.debug("Chooser timeout edit failed error=%s", edit_err)
+
+
+async def enqueue_track(guild: discord.Guild, track: QueuedTrack) -> None:
+    """Add a track to the guild queue and start playback if nothing is running."""
+    queue = get_guild_queue(guild.id)
+    await queue.put(track)
+    vc = guild.voice_client
+    if vc and not vc.is_playing() and not vc.is_paused():
+        await play_next(guild)
+
+
+async def send_track_chooser(
+    guild: discord.Guild,
+    query: str,
+    results: List[SearchResult],
+    requester_id: int,
+    target: object,
+) -> None:
+    """Ask the user which hit they meant."""
+    view = TrackChooserView(query, results, requester_id, target)
+    embed = build_chooser_embed(query, results)
+    message = await safe_send(target, embed=embed, view=view)
+    if message:
+        view.message = message
+        return
+
+    # No Embed Links permission: fall back to playing the best guess rather than
+    # leaving the request silently unanswered.
+    view.stop()
+    logger.warning("Chooser could not be sent; playing top hit for %r", query)
+    top = results[0]
+    await safe_send(target, f"🎶 Nem tudtam listát küldeni, ezt indítom: **{top.title}**")
+    await enqueue_track(
+        guild,
+        QueuedTrack(source=top.url, title=top.title, target=target, candidates=results),
+    )
+
+
 async def send_player_message(guild: discord.Guild, track: QueuedTrack) -> None:
     """Replace the previous control panel with a fresh one for the new track."""
     await retire_player_message(guild.id)
@@ -1151,11 +1431,15 @@ async def play(ctx, *, query: str):
         if not candidates:
             await ctx.send("❌ Nem találtam eredményt.")
             return
-        watch_url, title = candidates[0]
+        if candidates[0].score < SEARCH_CONFIDENT_SCORE:
+            # Something the user typed is missing from the best title; let them pick.
+            await send_track_chooser(ctx.guild, query, candidates, ctx.author.id, ctx)
+            return
+        top = candidates[0]
         await queue.put(
-            QueuedTrack(source=watch_url, title=title, target=ctx, candidates=candidates)
+            QueuedTrack(source=top.url, title=top.title, target=ctx, candidates=candidates)
         )
-        added_titles.append(title)
+        added_titles.append(top.title)
 
     if added_titles:
         if len(added_titles) == 1:
@@ -1299,6 +1583,17 @@ async def stop_cmd(ctx):
     await ctx.send("⏹️ Lejátszás leállítva és várólista törölve.")
 
 
+@bot.command(name='info')
+async def info_cmd(ctx):
+    """Explain every command and button."""
+    embed = build_info_embed()
+    if not await safe_send(ctx, embed=embed):
+        # No Embed Links permission here; a bare pointer beats silence.
+        await safe_send(ctx, f"ℹ️ A súgóhoz *Embed Links* jog kell. Parancsok: `{PREFIX}play`, "
+                             f"`{PREFIX}skip`, `{PREFIX}pause`, `{PREFIX}resume`, `{PREFIX}queue`, "
+                             f"`{PREFIX}shuffle`, `{PREFIX}stop`, `{PREFIX}join`, `{PREFIX}leave`.")
+
+
 @bot.command(name='shuffle')
 async def shuffle_cmd(ctx):
     """Shuffle the current queue."""
@@ -1407,11 +1702,19 @@ async def play_slash(interaction: discord.Interaction, query: str):
         if not candidates:
             await interaction.followup.send("❌ Nem találtam eredményt.")
             return
-        watch_url, title = candidates[0]
+        if candidates[0].score < SEARCH_CONFIDENT_SCORE:
+            # Something the user typed is missing from the best title; let them pick.
+            await send_track_chooser(
+                interaction.guild, query, candidates, interaction.user.id, interaction
+            )
+            return
+        top = candidates[0]
         await queue.put(
-            QueuedTrack(source=watch_url, title=title, target=interaction, candidates=candidates)
+            QueuedTrack(
+                source=top.url, title=top.title, target=interaction, candidates=candidates
+            )
         )
-        added_titles.append(title)
+        added_titles.append(top.title)
 
     if added_titles:
         if len(added_titles) == 1:
@@ -1425,6 +1728,11 @@ async def play_slash(interaction: discord.Interaction, query: str):
 
     if vc and not vc.is_playing() and not vc.is_paused():
         await play_next(interaction.guild)
+
+
+@music_group.command(name="info", description="Elmagyarázza az összes parancsot és gombot.")
+async def info_slash(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_info_embed())
 
 
 @music_group.command(name="skip", description="Kihagyja az aktuálisan játszott számot.")
