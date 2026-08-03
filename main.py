@@ -8,7 +8,7 @@ import time
 import logging
 import unicodedata
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Iterable
 
 import discord
 from discord.ext import commands
@@ -701,49 +701,94 @@ def parse_spotify_id(url: str) -> Optional[Tuple[str, str]]:
     return match.group(1), match.group(2)
 
 
-async def get_spotify_tracks(url: str) -> List[str]:
-    """Given a Spotify URL, return a list of track names with artist for searching."""
-    result: List[str] = []
+MAX_SPOTIFY_TRACKS = 50
+
+SPOTIFY_ERROR_MESSAGES = {
+    "no_client": "❌ A Spotify támogatás nincs beállítva (hiányzó SPOTIFY_CLIENT_ID/SECRET).",
+    "bad_url": "❌ Ezt a Spotify linket nem ismerem fel. Szám, album vagy lejátszási lista linkje kell.",
+    "forbidden": (
+        "❌ A Spotify nem engedi ennek a botnak a lejátszási listák tartalmát kiolvasni.\n"
+        "➡️ **Album** és **egy-egy szám** linkje viszont működik, vagy másold be a számok címét."
+    ),
+    "not_found": (
+        "❌ Ezt a lejátszási listát a Spotify nem adja ki a botoknak — az algoritmikus és a "
+        "Spotify által készített listák (Daily Mix, rádió, Neked készült) le vannak zárva.\n"
+        "➡️ Próbáld egy saját készítésű listával, albummal, vagy szám linkkel."
+    ),
+    "empty": "❌ Ez a Spotify tartalom üres.",
+    "error": "❌ Nem sikerült beolvasni a Spotify tartalmat.",
+}
+
+
+def spotify_error_message(code: str) -> str:
+    return SPOTIFY_ERROR_MESSAGES.get(code, SPOTIFY_ERROR_MESSAGES["error"])
+
+
+async def get_spotify_tracks(url: str) -> Tuple[List[str], Optional[str]]:
+    """Resolve a Spotify URL to search terms, plus an error code when it fails.
+
+    The error code matters: Spotify answers 404 for its own algorithmic playlists
+    and 403 for everyone else's playlist contents, and the two need different
+    advice. Collapsing them into "empty or unreadable" sent people chasing the
+    wrong problem.
+    """
     if not SPOTIFY_CLIENT:
-        return result
+        return [], "no_client"
     parsed = parse_spotify_id(url)
     if not parsed:
-        return result
+        return [], "bad_url"
     content_type, spotify_id = parsed
+
+    def _describe(name: str, artists: Iterable[dict]) -> str:
+        return f"{name} {', '.join(a['name'] for a in artists)}"
+
     def _fetch_tracks() -> List[str]:
         local_result: List[str] = []
         if content_type == 'track':
             track = SPOTIFY_CLIENT.track(spotify_id)
-            name = track['name']
-            artists = ', '.join(artist['name'] for artist in track['artists'])
-            local_result.append(f"{name} {artists}")
+            local_result.append(_describe(track['name'], track['artists']))
         elif content_type == 'album':
-            album_tracks = SPOTIFY_CLIENT.album_tracks(spotify_id)
-            for item in album_tracks['items']:
-                name = item['name']
-                artists = ', '.join(artist['name'] for artist in item['artists'])
-                local_result.append(f"{name} {artists}")
+            page = SPOTIFY_CLIENT.album_tracks(spotify_id, limit=50)
+            while page:
+                for item in page['items']:
+                    local_result.append(_describe(item['name'], item['artists']))
+                    if len(local_result) >= MAX_SPOTIFY_TRACKS:
+                        return local_result
+                # Albums longer than one page were silently truncated before.
+                page = SPOTIFY_CLIENT.next(page) if page.get('next') else None
         elif content_type == 'playlist':
-            # limit to first 50 tracks to prevent huge queues
-            playlist_tracks = SPOTIFY_CLIENT.playlist_items(
+            page = SPOTIFY_CLIENT.playlist_items(
                 spotify_id,
-                fields='items(track(name,artists(name)))',
+                fields='next,items(track(name,artists(name)))',
                 additional_types=['track'],
-                limit=50
+                limit=50,
             )
-            for item in playlist_tracks['items']:
-                track = item['track']
-                if track:
-                    name = track['name']
-                    artists = ', '.join(a['name'] for a in track['artists'])
-                    local_result.append(f"{name} {artists}")
+            while page:
+                for item in page['items']:
+                    track = item.get('track')
+                    if not track:
+                        continue
+                    local_result.append(_describe(track['name'], track['artists']))
+                    if len(local_result) >= MAX_SPOTIFY_TRACKS:
+                        return local_result
+                page = SPOTIFY_CLIENT.next(page) if page.get('next') else None
         return local_result
 
     try:
-        result = await asyncio.wait_for(asyncio.to_thread(_fetch_tracks), timeout=15.0)
+        result = await asyncio.wait_for(asyncio.to_thread(_fetch_tracks), timeout=SEARCH_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning("Spotify fetch timeout url=%r", url)
+        return [], "error"
     except Exception as e:
-        logger.warning("Spotify fetch failed error=%s", e)
-    return result
+        status = getattr(e, "http_status", None)
+        logger.warning("Spotify fetch failed url=%r status=%s error=%s", url, status, e)
+        if status == 403:
+            return [], "forbidden"
+        if status == 404:
+            return [], "not_found"
+        return [], "error"
+
+    return result, None if result else "empty"
 
 
 @bot.event
@@ -974,8 +1019,10 @@ def build_info_embed() -> discord.Embed:
         value=(
             f"**`/music play <szám>`** • `{PREFIX}play <szám>`\n"
             "Keres és lejátszik. Megy a szám címe, egy YouTube link, vagy egy "
-            "Spotify szám/album/lejátszási lista linkje is.\n"
-            "Ha már szól valami, a várólista végére kerül."
+            "**Spotify szám/album** linkje is.\n"
+            "Ha már szól valami, a várólista végére kerül.\n"
+            "⚠️ Spotify **lejátszási listát** nem tud beolvasni: a Spotify ezt a "
+            "botoknak nem engedi."
         ),
         inline=False,
     )
@@ -1417,9 +1464,10 @@ async def play(ctx, *, query: str):
     added_titles: List[str] = []
     if is_spotify_url(query) and SPOTIFY_CLIENT:
         await ctx.send("🎧 Spotify link felismerve, számok hozzáadása...")
-        track_terms = await get_spotify_tracks(query)
-        if not track_terms:
-            await ctx.send("❌ Nem sikerült beolvasni a Spotify tartalmat, vagy üres a lejátszási lista.")
+        track_terms, spotify_error = await get_spotify_tracks(query)
+        if spotify_error:
+            await ctx.send(spotify_error_message(spotify_error))
+            return
         # Queue the search terms as-is: resolving every track up front made a
         # long playlist take minutes before the first note played.
         for term in track_terms:
@@ -1688,9 +1736,10 @@ async def play_slash(interaction: discord.Interaction, query: str):
 
     if is_spotify_url(query) and SPOTIFY_CLIENT:
         await interaction.followup.send("🎧 Spotify link felismerve, számok hozzáadása...")
-        track_terms = await get_spotify_tracks(query)
-        if not track_terms:
-            await interaction.followup.send("❌ Nem sikerült beolvasni a Spotify tartalmat, vagy üres a lejátszási lista.")
+        track_terms, spotify_error = await get_spotify_tracks(query)
+        if spotify_error:
+            await interaction.followup.send(spotify_error_message(spotify_error))
+            return
         # Queue the search terms as-is: resolving every track up front made a
         # long playlist take minutes before the first note played.
         for term in track_terms:
