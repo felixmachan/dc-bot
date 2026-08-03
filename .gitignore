@@ -1,4 +1,12 @@
 # Created by venv; see https://docs.python.org/3/library/venv.html
 .venv/
+venv/
 Lib
 .env
+
+# Spotipy token cache - holds a live access token, must never be committed
+.cache
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
