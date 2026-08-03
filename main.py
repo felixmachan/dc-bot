@@ -6,7 +6,8 @@ import glob
 import shutil
 import time
 import logging
-from typing import List, Tuple, Optional, Iterable
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
 
 import discord
 from discord.ext import commands
@@ -63,6 +64,17 @@ GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW and GUILD_ID_RAW.isdigit() else Non
 VOICE_CONNECT_TIMEOUT_SEC = parse_int_env("VOICE_CONNECT_TIMEOUT_SEC", 30, minimum=5)
 VOICE_CONNECT_RETRIES = parse_int_env("VOICE_CONNECT_RETRIES", 3, minimum=1)
 VOICE_RETRY_BACKOFF_SEC = parse_int_env("VOICE_RETRY_BACKOFF_SEC", 2, minimum=1)
+SEARCH_TIMEOUT_SEC = parse_int_env("SEARCH_TIMEOUT_SEC", 20, minimum=5)
+SEARCH_CANDIDATES = parse_int_env("SEARCH_CANDIDATES", 5, minimum=1)
+# Empty by default: yt-dlp's own client selection is measurably the most reliable
+# and the fastest, and it keeps adapting as YouTube changes. Pinning clients here
+# (the previous 'android,web') only ever pins us to whatever breaks next, so this
+# exists purely as an escape hatch when a specific client must be forced.
+YTDLP_PLAYER_CLIENTS = [
+    client.strip()
+    for client in os.getenv("YTDLP_PLAYER_CLIENTS", "").split(",")
+    if client.strip()
+]
 
 LOG_LEVEL = parse_log_level()
 logging.basicConfig(
@@ -81,16 +93,44 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 last_resync_ts: float = 0.0
 
+
+@dataclass
+class QueuedTrack:
+    """One queued song.
+
+    `source` is a YouTube watch URL or a plain search term - never a direct
+    media URL. Media URLs are resolved in start_track right before playback,
+    because YouTube stream URLs expire (and are IP bound), so anything resolved
+    at enqueue time is often dead by the time a long queue reaches it.
+    """
+
+    source: str
+    title: str
+    target: object
+    attempts: int = 0
+    # Pre-searched (watch_url, title) fallbacks, tried in order at playback time.
+    # Watch URLs do not expire, so caching these is safe; only the media URL is
+    # short lived. Empty means "derive from source on first play".
+    candidates: List[Tuple[str, str]] = field(default_factory=list)
+
+
 # Per‑guild song queues and currently playing information
-# Each item in the queue is a tuple of (audio_url, title, target)
 song_queue: dict[int, asyncio.Queue] = {}
 now_playing: dict[int, str] = {}
-current_track: dict[int, Tuple[str, str, object]] = {}
+current_track: dict[int, QueuedTrack] = {}
 playback_locks: dict[int, asyncio.Lock] = {}
 voice_reconnect_locks: dict[int, asyncio.Lock] = {}
 last_voice_channel_id: dict[int, int] = {}
 track_recovery_attempts: dict[int, int] = {}
 MAX_TRACK_RECOVERY_ATTEMPTS = 2
+# A track that cannot be started after this many queue passes is dropped instead
+# of being re-queued forever.
+MAX_TRACK_START_ATTEMPTS = 3
+# How many search candidates we are willing to fully extract before giving up.
+MAX_RESOLVE_CANDIDATES = 3
+# Last "now playing" controller message per guild, so the old button set can be
+# retired when a new track starts.
+player_messages: dict[int, discord.Message] = {}
 autocomplete_cache: dict[str, Tuple[float, List[str]]] = {}
 AUTOCOMPLETE_CACHE_TTL_SECONDS = 30.0
 autocomplete_inflight: dict[str, asyncio.Task] = {}
@@ -445,57 +485,159 @@ async def yt_autocomplete(
     return []
 
 
-async def search_youtube(term: str) -> Optional[Tuple[str, str]]:
-    """Search YouTube using yt_dlp and return the first audio result (url, title)."""
+# Premieres that have not started and streams still being processed have no media
+# to read. Actual live streams are playable, so they are only deprioritised.
+UNPLAYABLE_LIVE_STATUS = {'is_upcoming', 'post_live'}
+
+
+def is_playable_entry(entry: dict) -> bool:
+    """Reject only entries with no readable media, e.g. an unstarted premiere."""
+    return entry.get('live_status') not in UNPLAYABLE_LIVE_STATUS
+
+
+def is_live_entry(entry: dict) -> bool:
+    """True for an in-progress live stream (playable, but a poor match for a song search)."""
+    return bool(entry.get('is_live')) or entry.get('live_status') == 'is_live'
+
+
+async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List[Tuple[str, str]]:
+    """Return up to `limit` (watch_url, title) candidates for a search term.
+
+    This deliberately uses a flat search: it is one cheap request and it never
+    fails just because the top hit happens to be region blocked, age gated or a
+    live stream. Picking a usable candidate is left to resolve_stream_url.
+    """
+    if is_url(term):
+        return [(term, term)]
+
+    search_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'extract_flat': True,
+        'skip_download': True,
+    }
+
+    def _search() -> object:
+        with yt_dlp.YoutubeDL(search_opts) as ydl:
+            return ydl.extract_info(f"ytsearch{limit}:{term}", download=False)
+
+    try:
+        info = await asyncio.wait_for(asyncio.to_thread(_search), timeout=SEARCH_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning("yt-dlp search timeout term=%r timeout=%ds", term, SEARCH_TIMEOUT_SEC)
+        return []
+    except Exception as e:
+        logger.error("yt-dlp search error term=%r error=%s", term, e)
+        return []
+
+    ranked: List[Tuple[bool, str, str]] = []
+    for entry in (info or {}).get('entries', []) or []:
+        if not entry or not is_playable_entry(entry):
+            continue
+        watch_url = entry.get('url') or entry.get('webpage_url')
+        video_id = entry.get('id')
+        if not watch_url and video_id:
+            watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        if not watch_url:
+            continue
+        ranked.append((is_live_entry(entry), watch_url, entry.get('title') or 'Ismeretlen'))
+
+    # Stable sort keeps YouTube's own relevance order within each group while
+    # pushing 24/7 streams behind real uploads. A search for a song should not
+    # land on a radio stream, but "lofi hip hop radio" must still work when a
+    # stream is all there is.
+    ranked.sort(key=lambda item: item[0])
+    candidates: List[Tuple[str, str]] = [(url, title) for _, url, title in ranked]
+
+    if not candidates:
+        logger.warning("yt-dlp search returned no usable candidate term=%r", term)
+    else:
+        logger.debug("yt-dlp search term=%r candidates=%d", term, len(candidates))
+    return candidates
+
+
+async def resolve_stream_url(candidates: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+    """Resolve the first playable candidate to a fresh (stream_url, title).
+
+    Called right before playback so the media URL is as young as possible, and it
+    walks the candidate list, so one broken video does not sink the whole request.
+    """
+    if not candidates:
+        return None
+
     ydl_opts = {
         'format': 'bestaudio[ext=m4a]/bestaudio[acodec!=none]/best',
         'quiet': True,
+        'no_warnings': True,
         'noplaylist': True,
         'extract_flat': False,
         'skip_download': True,
-        # Prefer clients that usually expose direct media URLs over SABR-limited web formats.
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],
-            }
-        },
     }
-    search_term = term if is_url(term) else f"ytsearch:{term}"
-    def _extract() -> object:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(search_term, download=False)
+    if YTDLP_PLAYER_CLIENTS:
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': YTDLP_PLAYER_CLIENTS}}
 
-    try:
-        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=15.0)
-    except asyncio.TimeoutError:
-        logger.warning("yt-dlp search timeout term=%r", term)
-        return None
-    except Exception as e:
-        logger.error("yt-dlp search error term=%r error=%s", term, e)
-        return None
-    # Normalise entries
-    entries = info.get('entries', [info])
-    if not entries:
-        return None
-    entry = entries[0]
-    # Let yt-dlp provide the final selected URL first; manual format fallback only if needed.
-    audio_url = entry.get('url')
-    if not audio_url:
-        formats = entry.get('formats', [])
-        audio_formats = [
-            f for f in formats
-            if f.get('acodec') != 'none'
-            and f.get('vcodec') == 'none'
-            and f.get('url')
-            and f.get('protocol') not in {'m3u8', 'http_dash_segments'}
-        ]
-        if audio_formats:
+    def _extract(url: str) -> object:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    last_error: Optional[str] = None
+    # Cap the retries: every failed candidate costs a full extraction round trip,
+    # and dead air while we grind through five of them is worse than failing fast.
+    for watch_url, fallback_title in candidates[:MAX_RESOLVE_CANDIDATES]:
+        try:
+            info = await asyncio.wait_for(
+                asyncio.to_thread(_extract, watch_url), timeout=SEARCH_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            last_error = "timeout"
+            logger.warning("yt-dlp resolve timeout url=%r", watch_url)
+            continue
+        except Exception as e:
+            last_error = str(e)
+            logger.warning("yt-dlp resolve failed url=%r error=%s", watch_url, e)
+            continue
+
+        entries = (info or {}).get('entries') or [info]
+        entry = entries[0] if entries else None
+        if not entry or not is_playable_entry(entry):
+            last_error = "not playable (unstarted premiere / still processing)"
+            continue
+
+        audio_url = entry.get('url')
+        if not audio_url:
+            audio_formats = [
+                f for f in entry.get('formats', [])
+                if f.get('acodec') != 'none'
+                and f.get('vcodec') == 'none'
+                and f.get('url')
+                and f.get('protocol') not in {'m3u8', 'http_dash_segments'}
+            ]
+            if not audio_formats:
+                last_error = "no audio-only format"
+                logger.warning("no usable audio format url=%r", watch_url)
+                continue
             audio_formats.sort(key=lambda f: f.get('abr') or f.get('asr') or 0, reverse=True)
             audio_url = audio_formats[0]['url']
-        else:
-            return None
-    title = entry.get('title', 'Ismeretlen')
-    return audio_url, title
+
+        return audio_url, entry.get('title') or fallback_title
+
+    logger.error(
+        "resolve failed for all %d candidate(s) first=%r last_error=%s",
+        len(candidates), candidates[0][0], last_error,
+    )
+    return None
+
+
+async def resolve_track(track: QueuedTrack) -> Optional[Tuple[str, str]]:
+    """Resolve a queued track to a playable (stream_url, title)."""
+    if not track.candidates:
+        # Spotify entries and prefix-command URLs arrive without a candidate list.
+        track.candidates = (
+            [(track.source, track.title)] if is_url(track.source)
+            else await search_youtube(track.source)
+        )
+    return await resolve_stream_url(track.candidates)
 
 
 def parse_spotify_id(url: str) -> Optional[Tuple[str, str]]:
@@ -555,6 +697,9 @@ async def get_spotify_tracks(url: str) -> List[str]:
 @bot.event
 async def on_ready():
     logger.info("Bot elindult user=%s", bot.user)
+    # Register the control panel once so buttons on messages from a previous
+    # process keep working after a restart.
+    bot.add_view(PlayerView())
     try:
         # Keep a global registration for portability across guilds.
         # If a guild ID is configured, sync that too for faster propagation there.
@@ -568,14 +713,48 @@ async def on_ready():
         logger.error("Slash parancs sync sikertelen error=%s", e)
 
 
-async def safe_send(target: object, message: str):
-    """Send a message to either Context or Interaction target safely."""
+async def safe_send(
+    target: object,
+    message: Optional[str] = None,
+    *,
+    embed: Optional[discord.Embed] = None,
+    view: Optional[discord.ui.View] = None,
+) -> Optional[discord.Message]:
+    """Send to either a Context or an Interaction target, returning the sent message."""
+    kwargs: dict = {}
+    if message is not None:
+        kwargs["content"] = message
+    if embed is not None:
+        kwargs["embed"] = embed
+    if view is not None:
+        kwargs["view"] = view
+
+    # Context has .send; Interaction does not. Resolve the attribute separately so a
+    # genuine AttributeError raised inside the send call is not mistaken for the
+    # wrong target type.
+    sender = getattr(target, "send", None)
+    if sender is not None:
+        try:
+            return await sender(**kwargs)
+        except Exception as send_err:
+            logger.warning("safe_send failed error=%s", send_err)
+            return None
+
+    # For interactions, send to the channel rather than the followup webhook: these
+    # announcements fire while a long queue plays, and an interaction token dies
+    # after 15 minutes.
+    channel = getattr(target, "channel", None)
+    if channel is not None:
+        try:
+            return await channel.send(**kwargs)
+        except Exception as send_err:
+            logger.warning("safe_send channel send failed error=%s", send_err)
+
     try:
-        await target.send(message)  # type: ignore[attr-defined]
-    except AttributeError:
-        await target.followup.send(message)  # type: ignore[attr-defined]
+        return await target.followup.send(wait=True, **kwargs)  # type: ignore[attr-defined]
     except Exception as send_err:
         logger.warning("safe_send failed error=%s", send_err)
+        return None
 
 
 async def ensure_voice_connection(guild: discord.Guild, target: Optional[object] = None) -> Optional[discord.VoiceClient]:
@@ -602,17 +781,179 @@ async def ensure_voice_connection(guild: discord.Guild, target: Optional[object]
 
 
 
-async def start_track(guild: discord.Guild, url: str, title: str, target: object, announce: bool = True) -> bool:
-    """Start playing one track and wire an error-tolerant after callback."""
-    vc = await ensure_voice_connection(guild, target)
+def queued_titles(guild_id: int) -> List[str]:
+    """Snapshot upcoming titles without consuming the queue."""
+    queue = get_guild_queue(guild_id)
+    return [track.title for track in list(queue._queue)]  # type: ignore[attr-defined]
+
+
+def build_player_embed(guild_id: int, track: QueuedTrack) -> discord.Embed:
+    """Build the now-playing embed that carries the control buttons."""
+    embed = discord.Embed(
+        title="🎶 Most játszom",
+        description=f"**{track.title}**",
+        color=discord.Color.blurple(),
+    )
+    if is_url(track.source):
+        embed.url = track.source
+
+    upcoming = queued_titles(guild_id)
+    if upcoming:
+        preview = "\n".join(f"{idx}. {title}" for idx, title in enumerate(upcoming[:3], start=1))
+        if len(upcoming) > 3:
+            preview += f"\n…és még {len(upcoming) - 3} további."
+        embed.add_field(name=f"Következik ({len(upcoming)})", value=preview, inline=False)
+    else:
+        embed.add_field(name="Következik", value="A várólista üres.", inline=False)
+    return embed
+
+
+class PlayerView(discord.ui.View):
+    """Persistent control panel attached to the now-playing embed.
+
+    Stateless on purpose: every handler reads the guild off the interaction, so a
+    single instance registered in on_ready keeps working after a bot restart.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _voice_client(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
+        """Return the voice client if the clicking user is allowed to control it."""
+        vc = interaction.guild.voice_client if interaction.guild else None
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("ℹ️ Nem vagyok voice csatornában.", ephemeral=True)
+            return None
+        user_voice = getattr(interaction.user, "voice", None)
+        if not user_voice or user_voice.channel != vc.channel:
+            await interaction.response.send_message(
+                "❗ Ehhez ugyanabban a hangcsatornában kell lenned, mint a bot.", ephemeral=True
+            )
+            return None
+        return vc
+
+    @discord.ui.button(emoji="⏯️", label="Pause/Resume", style=discord.ButtonStyle.secondary, custom_id="player:playpause")
+    async def playpause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await self._voice_client(interaction)
+        if not vc:
+            return
+        if vc.is_playing():
+            vc.pause()
+            await interaction.response.send_message("⏸️ Szüneteltetve.", ephemeral=True)
+        elif vc.is_paused():
+            vc.resume()
+            await interaction.response.send_message("▶️ Folytatva.", ephemeral=True)
+        else:
+            await interaction.response.send_message("ℹ️ Nem játszik semmi.", ephemeral=True)
+
+    @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.primary, custom_id="player:skip")
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await self._voice_client(interaction)
+        if not vc:
+            return
+        if vc.is_playing() or vc.is_paused():
+            # stop() fires the after callback, which advances the queue.
+            vc.stop()
+            await interaction.response.send_message(
+                f"⏭️ {interaction.user.display_name} kihagyta az aktuális számot."
+            )
+        else:
+            await interaction.response.send_message("ℹ️ Nem játszik semmi.", ephemeral=True)
+
+    @discord.ui.button(emoji="⏹️", label="Stop", style=discord.ButtonStyle.danger, custom_id="player:stop")
+    async def stop_playback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await self._voice_client(interaction)
+        if not vc:
+            return
+        clear_queue(interaction.guild.id)
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+        now_playing.pop(interaction.guild.id, None)
+        current_track.pop(interaction.guild.id, None)
+        track_recovery_attempts.pop(interaction.guild.id, None)
+        await interaction.response.send_message(
+            f"⏹️ {interaction.user.display_name} leállította a lejátszást, a várólista törölve."
+        )
+
+    @discord.ui.button(emoji="🔀", label="Shuffle", style=discord.ButtonStyle.secondary, custom_id="player:shuffle")
+    async def shuffle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        vc = await self._voice_client(interaction)
+        if not vc:
+            return
+        queue = get_guild_queue(interaction.guild.id)
+        items = list(queue._queue)  # type: ignore[attr-defined]
+        if len(items) < 2:
+            await interaction.response.send_message("ℹ️ Nincs elég szám a keveréshez.", ephemeral=True)
+            return
+        random.shuffle(items)
+        queue._queue.clear()  # type: ignore[attr-defined]
+        for item in items:
+            queue.put_nowait(item)
+        await interaction.response.send_message("🔀 A várólista megkeverve.", ephemeral=True)
+
+    @discord.ui.button(emoji="📜", label="Queue", style=discord.ButtonStyle.secondary, custom_id="player:queue")
+    async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
+        titles = queued_titles(interaction.guild.id)
+        if not titles:
+            await interaction.response.send_message("ℹ️ A várólista üres.", ephemeral=True)
+            return
+        lines = [f"{idx}. {title}" for idx, title in enumerate(titles[:10], start=1)]
+        if len(titles) > 10:
+            lines.append(f"…és még {len(titles) - 10} további.")
+        await interaction.response.send_message(
+            f"**Várólista ({len(titles)} szám):**\n" + "\n".join(lines), ephemeral=True
+        )
+
+
+async def send_player_message(guild: discord.Guild, track: QueuedTrack) -> None:
+    """Replace the previous control panel with a fresh one for the new track."""
+    await retire_player_message(guild.id)
+    embed = build_player_embed(guild.id, track)
+    message = await safe_send(track.target, embed=embed, view=PlayerView())
+    if message:
+        player_messages[guild.id] = message
+
+
+async def retire_player_message(guild_id: int) -> None:
+    """Strip the buttons off the previous now-playing message so only one panel is live."""
+    message = player_messages.pop(guild_id, None)
+    if not message:
+        return
+    try:
+        await message.edit(view=None)
+    except Exception as edit_err:
+        logger.debug("Player message retire failed error=%s", edit_err)
+
+
+def clear_queue(guild_id: int) -> None:
+    """Drop every queued track for a guild."""
+    queue = get_guild_queue(guild_id)
+    while not queue.empty():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+
+async def start_track(guild: discord.Guild, track: QueuedTrack, announce: bool = True) -> bool:
+    """Resolve a fresh media URL and start playing one track."""
+    vc = await ensure_voice_connection(guild, track.target)
     if not vc:
         return False
     if not FFMPEG_EXE:
         logger.error("FFmpeg nincs telepitve vagy nem talalhato.")
         return False
 
+    # Resolved here rather than at enqueue time: YouTube media URLs expire.
+    resolved = await resolve_track(track)
+    if not resolved:
+        logger.warning("Nem sikerult feloldani a szamot source=%r", track.source)
+        return False
+    stream_url, resolved_title = resolved
+    track.title = resolved_title
+
     source = discord.FFmpegPCMAudio(
-        url,
+        stream_url,
         executable=FFMPEG_EXE,
         before_options=(
             "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 "
@@ -635,10 +976,10 @@ async def start_track(guild: discord.Guild, url: str, title: str, target: object
         source.cleanup()
         return False
 
-    now_playing[guild.id] = title
-    current_track[guild.id] = (url, title, target)
+    now_playing[guild.id] = track.title
+    current_track[guild.id] = track
     if announce:
-        await safe_send(target, f"🎶 Most játszom: **{title}**")
+        await send_player_message(guild, track)
     return True
 
 
@@ -652,7 +993,9 @@ async def handle_track_end(guild: discord.Guild, error: Optional[Exception]):
             if attempts < MAX_TRACK_RECOVERY_ATTEMPTS:
                 track_recovery_attempts[guild.id] = attempts + 1
                 await asyncio.sleep(1.5)
-                ok = await start_track(guild, track[0], track[1], track[2], announce=False)
+                # start_track re-resolves the media URL, which also recovers from
+                # an expired stream URL rather than just retrying the dead one.
+                ok = await start_track(guild, track, announce=False)
                 if ok:
                     return
 
@@ -719,7 +1062,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                     attempts = track_recovery_attempts.get(guild.id, 0)
                     if attempts < MAX_TRACK_RECOVERY_ATTEMPTS:
                         track_recovery_attempts[guild.id] = attempts + 1
-                        ok = await start_track(guild, track[0], track[1], track[2], announce=False)
+                        ok = await start_track(guild, track, announce=False)
                         if ok:
                             return
                 await play_next(guild)
@@ -758,6 +1101,7 @@ async def leave(ctx):
         current_track.pop(guild_id, None)
         track_recovery_attempts.pop(guild_id, None)
         last_voice_channel_id.pop(guild_id, None)
+        await retire_player_message(guild_id)
         await ctx.voice_client.disconnect(force=True)
         await ctx.send("👋 Kiléptem a voice csatornából.")
     else:
@@ -788,22 +1132,22 @@ async def play(ctx, *, query: str):
         track_terms = await get_spotify_tracks(query)
         if not track_terms:
             await ctx.send("❌ Nem sikerült beolvasni a Spotify tartalmat, vagy üres a lejátszási lista.")
+        # Queue the search terms as-is: resolving every track up front made a
+        # long playlist take minutes before the first note played.
         for term in track_terms:
-            res = await search_youtube(term)
-            if res:
-                audio_url, title = res
-                await queue.put((audio_url, title, ctx))
-                added_titles.append(title)
+            await queue.put(QueuedTrack(source=term, title=term, target=ctx))
+            added_titles.append(term)
     else:
         await ctx.send(f"🔎 Keresés: {query}")
-        res = await search_youtube(query)
-        if res:
-            audio_url, title = res
-            await queue.put((audio_url, title, ctx))
-            added_titles.append(title)
-        else:
+        candidates = await search_youtube(query)
+        if not candidates:
             await ctx.send("❌ Nem találtam eredményt.")
             return
+        watch_url, title = candidates[0]
+        await queue.put(
+            QueuedTrack(source=watch_url, title=title, target=ctx, candidates=candidates)
+        )
+        added_titles.append(title)
 
     if added_titles:
         if len(added_titles) == 1:
@@ -833,6 +1177,7 @@ async def play_next(guild: discord.Guild):
             current_track.pop(guild.id, None)
             now_playing.pop(guild.id, None)
             track_recovery_attempts.pop(guild.id, None)
+            await retire_player_message(guild.id)
             return
         vc = await ensure_voice_connection(guild)
         if not vc:
@@ -843,7 +1188,7 @@ async def play_next(guild: discord.Guild):
         if vc.is_playing() or vc.is_paused():
             return
         try:
-            url, title, target = queue.get_nowait()
+            track = queue.get_nowait()
         except asyncio.QueueEmpty:
             mark_intentional_voice_disconnect(guild.id)
             current_track.pop(guild.id, None)
@@ -851,10 +1196,21 @@ async def play_next(guild: discord.Guild):
             track_recovery_attempts.pop(guild.id, None)
             await vc.disconnect(force=True)
             return
-        ok = await start_track(guild, url, title, target)
+        ok = await start_track(guild, track)
         if not ok:
-            await queue.put((url, title, target))
-            bot.loop.create_task(retry_play_next_later(guild, 2.0))
+            track.attempts += 1
+            if track.attempts >= MAX_TRACK_START_ATTEMPTS:
+                # Drop it instead of re-queueing forever; an unplayable track would
+                # otherwise loop through the queue indefinitely.
+                logger.warning(
+                    "Szam eldobva %d sikertelen inditas utan source=%r",
+                    track.attempts, track.source,
+                )
+                await safe_send(track.target, f"⚠️ Nem sikerült lejátszani: **{track.title}** — kihagyom.")
+                bot.loop.create_task(retry_play_next_later(guild, 1.0))
+            else:
+                await queue.put(track)
+                bot.loop.create_task(retry_play_next_later(guild, 2.0))
 
 
 @bot.command(name='skip')
@@ -905,11 +1261,11 @@ async def queue_cmd(ctx):
         await ctx.send("ℹ️ A várólista üres.")
         return
     # list items without removing them
-    items = list(queue._queue)  # type: ignore[attr-defined]
-    msg_lines = [f"Várólista ({len(items)} szám):"]
-    for idx, (_, title, _) in enumerate(items, start=1):
+    titles = queued_titles(ctx.guild.id)
+    msg_lines = [f"Várólista ({len(titles)} szám):"]
+    for idx, title in enumerate(titles, start=1):
         if idx > 10:
-            msg_lines.append(f"…és még {len(items) - 10} további.")
+            msg_lines.append(f"…és még {len(titles) - 10} további.")
             break
         msg_lines.append(f"{idx}. {title}")
     await ctx.send("\n".join(msg_lines))
@@ -931,6 +1287,7 @@ async def stop_cmd(ctx):
     now_playing.pop(ctx.guild.id, None)
     current_track.pop(ctx.guild.id, None)
     track_recovery_attempts.pop(ctx.guild.id, None)
+    await retire_player_message(ctx.guild.id)
     await ctx.send("⏹️ Lejátszás leállítva és várólista törölve.")
 
 
@@ -996,6 +1353,7 @@ async def leave_slash(interaction: discord.Interaction):
         current_track.pop(guild_id, None)
         track_recovery_attempts.pop(guild_id, None)
         last_voice_channel_id.pop(guild_id, None)
+        await retire_player_message(guild_id)
         await vc.disconnect(force=True)
         await interaction.response.send_message("👋 Kiléptem a voice csatornából.")
     else:
@@ -1030,22 +1388,22 @@ async def play_slash(interaction: discord.Interaction, query: str):
         track_terms = await get_spotify_tracks(query)
         if not track_terms:
             await interaction.followup.send("❌ Nem sikerült beolvasni a Spotify tartalmat, vagy üres a lejátszási lista.")
+        # Queue the search terms as-is: resolving every track up front made a
+        # long playlist take minutes before the first note played.
         for term in track_terms:
-            res = await search_youtube(term)
-            if res:
-                audio_url, title = res
-                await queue.put((audio_url, title, interaction))
-                added_titles.append(title)
+            await queue.put(QueuedTrack(source=term, title=term, target=interaction))
+            added_titles.append(term)
     else:
         await interaction.followup.send(f"🔎 Keresés: {query}")
-        res = await search_youtube(query)
-        if res:
-            audio_url, title = res
-            await queue.put((audio_url, title, interaction))
-            added_titles.append(title)
-        else:
+        candidates = await search_youtube(query)
+        if not candidates:
             await interaction.followup.send("❌ Nem találtam eredményt.")
             return
+        watch_url, title = candidates[0]
+        await queue.put(
+            QueuedTrack(source=watch_url, title=title, target=interaction, candidates=candidates)
+        )
+        added_titles.append(title)
 
     if added_titles:
         if len(added_titles) == 1:
@@ -1107,11 +1465,11 @@ async def queue_slash(interaction: discord.Interaction):
         await interaction.response.send_message("ℹ️ A várólista üres.")
         return
 
-    items: Iterable[Tuple[str, str, object]] = list(q._queue)  # type: ignore[attr-defined]
-    lines = [f"📋 Várólista ({len(items)} szám):"]
-    for idx, (_, title, _) in enumerate(items, start=1):
+    titles = queued_titles(interaction.guild.id)
+    lines = [f"📋 Várólista ({len(titles)} szám):"]
+    for idx, title in enumerate(titles, start=1):
         if idx > 10:
-            lines.append(f"...és még {len(items) - 10} további.")
+            lines.append(f"...és még {len(titles) - 10} további.")
             break
         lines.append(f"{idx}. {title}")
     await interaction.response.send_message("\n".join(lines))
@@ -1132,6 +1490,7 @@ async def stop_slash(interaction: discord.Interaction):
     now_playing.pop(interaction.guild.id, None)
     current_track.pop(interaction.guild.id, None)
     track_recovery_attempts.pop(interaction.guild.id, None)
+    await retire_player_message(interaction.guild.id)
     await interaction.response.send_message("⏹️ Lejátszás leállítva és várólista törölve.")
 
 
