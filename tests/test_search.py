@@ -10,6 +10,7 @@ class FakeYDL:
 
     def __init__(self, opts):
         self.opts = opts
+        FakeYDL.last_opts = opts
 
     def __enter__(self):
         return self

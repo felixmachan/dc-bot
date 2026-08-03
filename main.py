@@ -7,6 +7,7 @@ import shutil
 import time
 import logging
 import unicodedata
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Iterable
 
@@ -19,11 +20,12 @@ import yt_dlp
 
 try:
     import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
+    from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 except ImportError:
     # spotipy is optional; the bot will still work without Spotify support
     spotipy = None
     SpotifyClientCredentials = None
+    SpotifyOAuth = None
 
 
 load_dotenv()
@@ -67,6 +69,7 @@ VOICE_CONNECT_RETRIES = parse_int_env("VOICE_CONNECT_RETRIES", 3, minimum=1)
 VOICE_RETRY_BACKOFF_SEC = parse_int_env("VOICE_RETRY_BACKOFF_SEC", 2, minimum=1)
 SEARCH_TIMEOUT_SEC = parse_int_env("SEARCH_TIMEOUT_SEC", 20, minimum=5)
 SEARCH_CANDIDATES = parse_int_env("SEARCH_CANDIDATES", 5, minimum=1)
+YOUTUBE_PLAYLIST_LIMIT = parse_int_env("YOUTUBE_PLAYLIST_LIMIT", 50, minimum=1)
 # Empty by default: yt-dlp's own client selection is measurably the most reliable
 # and the fastest, and it keeps adapting as YouTube changes. Pinning clients here
 # (the previous 'android,web') only ever pins us to whatever breaks next, so this
@@ -87,6 +90,11 @@ logger = logging.getLogger("dc_bot")
 # Spotify credentials (optional)
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+# Set SPOTIFY_REDIRECT_URI to switch from app-only to user authorisation, which is
+# what playlist reads require. Must match a redirect URI registered on the app.
+SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
+SPOTIFY_TOKEN_CACHE = os.getenv("SPOTIFY_TOKEN_CACHE", ".spotify-token")
+SPOTIFY_SCOPE = "playlist-read-private playlist-read-collaborative"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -415,17 +423,132 @@ def is_url(text: str) -> bool:
     return re.match(url_pattern, text) is not None
 
 
+def is_youtube_playlist_url(url: str) -> bool:
+    """True for a link that means "the whole playlist".
+
+    A watch URL that merely carries a `list=` is the single video the user clicked
+    on while a playlist happened to be open, so that stays a single track. Only a
+    bare playlist link (no `v=`) queues the lot.
+    """
+    if not is_url(url):
+        return False
+    parsed = urllib.parse.urlparse(url)
+    if not any(host in parsed.netloc for host in ('youtube.com', 'youtu.be')):
+        return False
+    params = urllib.parse.parse_qs(parsed.query)
+    return bool(params.get('list')) and not params.get('v')
+
+
+async def get_youtube_playlist(
+    url: str, limit: int = YOUTUBE_PLAYLIST_LIMIT
+) -> Tuple[List[SearchResult], Optional[str]]:
+    """Expand a YouTube playlist link into its entries, newest cap applied."""
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        # The whole point here, unlike everywhere else in this file.
+        'noplaylist': False,
+        'extract_flat': True,
+        'skip_download': True,
+        'playlistend': limit,
+    }
+
+    def _extract() -> object:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    try:
+        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=SEARCH_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning("YouTube playlist timeout url=%r", url)
+        return [], "timeout"
+    except Exception as e:
+        logger.warning("YouTube playlist failed url=%r error=%s", url, e)
+        return [], "error"
+
+    results: List[SearchResult] = []
+    for entry in (info or {}).get('entries') or []:
+        if not entry or not is_playable_entry(entry):
+            continue
+        watch_url = entry.get('url') or entry.get('webpage_url')
+        if not watch_url and entry.get('id'):
+            watch_url = f"https://www.youtube.com/watch?v={entry['id']}"
+        if not watch_url:
+            continue
+        results.append(SearchResult(
+            url=watch_url,
+            title=entry.get('title') or 'Ismeretlen',
+            duration=entry.get('duration'),
+            uploader=entry.get('uploader') or entry.get('channel'),
+            is_live=is_live_entry(entry),
+            score=1.0,
+        ))
+
+    return (results, None) if results else ([], "empty")
+
+
+YOUTUBE_PLAYLIST_ERRORS = {
+    "timeout": "❌ A lejátszási lista beolvasása túl sokáig tartott.",
+    "empty": "❌ Ez a lejátszási lista üres, vagy nem érhető el (privát?).",
+    "error": "❌ Nem sikerült beolvasni ezt a YouTube lejátszási listát.",
+}
+
+
 def is_spotify_url(url: str) -> bool:
     """Quick check whether a URL points to Spotify content."""
     return 'open.spotify.com' in url
 
 
+def build_spotify_oauth() -> Optional["SpotifyOAuth"]:
+    """Build the user-auth manager, or None when it is not configured."""
+    if not SpotifyOAuth or not SPOTIFY_REDIRECT_URI:
+        return None
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    return SpotifyOAuth(
+        client_id=SPOTIFY_CLIENT_ID,
+        client_secret=SPOTIFY_CLIENT_SECRET,
+        redirect_uri=SPOTIFY_REDIRECT_URI,
+        scope=SPOTIFY_SCOPE,
+        cache_path=SPOTIFY_TOKEN_CACHE,
+        # The bot is headless; authorisation is a separate, deliberate step.
+        open_browser=False,
+    )
+
+
 def create_spotify_client() -> Optional[spotipy.Spotify]:
-    """Create a Spotify client if credentials are available and spotipy is installed."""
+    """Create a Spotify client, preferring user auth when it has been set up.
+
+    App-only credentials cannot read playlist contents - Spotify answers 403 for
+    a development-mode app - so user auth is the only route to playlists. It is
+    optional: without a cached token the bot falls back to app-only auth, which
+    still covers track and album links, rather than refusing to start.
+    """
     if not spotipy or not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         return None
-    auth_manager = SpotifyClientCredentials(client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET)
-    return spotipy.Spotify(auth_manager=auth_manager)
+
+    oauth = build_spotify_oauth()
+    if oauth:
+        try:
+            cached = oauth.cache_handler.get_cached_token()
+        except Exception as cache_err:
+            cached = None
+            logger.warning("Spotify token cache unreadable error=%s", cache_err)
+        if cached:
+            logger.info("Spotify: felhasznaloi hitelesites aktiv (playlistek olvashatok)")
+            return spotipy.Spotify(auth_manager=oauth)
+        logger.warning(
+            "Spotify: SPOTIFY_REDIRECT_URI be van allitva, de nincs token a %r fajlban. "
+            "Futtasd: python tools/spotify_authorize.py",
+            SPOTIFY_TOKEN_CACHE,
+        )
+
+    logger.info("Spotify: app-only hitelesites (szam es album megy, playlist nem)")
+    return spotipy.Spotify(
+        auth_manager=SpotifyClientCredentials(
+            client_id=SPOTIFY_CLIENT_ID, client_secret=SPOTIFY_CLIENT_SECRET
+        )
+    )
 
 
 SPOTIFY_CLIENT = create_spotify_client()
@@ -1021,11 +1144,12 @@ def build_info_embed() -> discord.Embed:
         name="▶️ Lejátszás",
         value=(
             f"**`/{group} play <szám>`** • `{PREFIX}play <szám>`\n"
-            "Keres és lejátszik. Megy a szám címe, egy YouTube link, vagy egy "
-            "**Spotify szám/album** linkje is.\n"
-            "Ha már szól valami, a várólista végére kerül.\n"
-            "⚠️ Spotify **lejátszási listát** nem tud beolvasni: a Spotify ezt a "
-            "botoknak nem engedi."
+            "Keres és lejátszik. Ha már szól valami, a várólista végére kerül.\n"
+            "Elfogad: **szám címét**, **YouTube linket**, "
+            f"**YouTube lejátszási listát** (max. {YOUTUBE_PLAYLIST_LIMIT} szám), "
+            "valamint **Spotify szám- és album-linket**.\n"
+            "⚠️ Spotify **lejátszási lista** nem megy — azt a Spotify nem adja ki a botoknak. "
+            "Használj helyette YouTube listát."
         ),
         inline=False,
     )
@@ -1467,7 +1591,18 @@ async def play(ctx, *, query: str):
         last_voice_channel_id[ctx.guild.id] = vc.channel.id
 
     added_titles: List[str] = []
-    if is_spotify_url(query) and SPOTIFY_CLIENT:
+    if is_youtube_playlist_url(query):
+        await ctx.send("📃 YouTube lejátszási lista felismerve, beolvasás...")
+        entries, playlist_error = await get_youtube_playlist(query)
+        if playlist_error:
+            await ctx.send(YOUTUBE_PLAYLIST_ERRORS[playlist_error])
+            return
+        for entry in entries:
+            await queue.put(
+                QueuedTrack(source=entry.url, title=entry.title, target=ctx, candidates=[entry])
+            )
+            added_titles.append(entry.title)
+    elif is_spotify_url(query) and SPOTIFY_CLIENT:
         await ctx.send("🎧 Spotify link felismerve, számok hozzáadása...")
         track_terms, spotify_error = await get_spotify_tracks(query)
         if spotify_error:
@@ -1739,7 +1874,18 @@ async def play_slash(interaction: discord.Interaction, query: str):
     queue = get_guild_queue(interaction.guild.id)
     added_titles: List[str] = []
 
-    if is_spotify_url(query) and SPOTIFY_CLIENT:
+    if is_youtube_playlist_url(query):
+        await interaction.followup.send("📃 YouTube lejátszási lista felismerve, beolvasás...")
+        entries, playlist_error = await get_youtube_playlist(query)
+        if playlist_error:
+            await interaction.followup.send(YOUTUBE_PLAYLIST_ERRORS[playlist_error])
+            return
+        for entry in entries:
+            await queue.put(QueuedTrack(
+                source=entry.url, title=entry.title, target=interaction, candidates=[entry]
+            ))
+            added_titles.append(entry.title)
+    elif is_spotify_url(query) and SPOTIFY_CLIENT:
         await interaction.followup.send("🎧 Spotify link felismerve, számok hozzáadása...")
         track_terms, spotify_error = await get_spotify_tracks(query)
         if spotify_error:

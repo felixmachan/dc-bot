@@ -4,8 +4,9 @@ venv/
 Lib
 .env
 
-# Spotipy token cache - holds a live access token, must never be committed
+# Spotipy token caches - hold live access/refresh tokens, must never be committed
 .cache
+.spotify-token
 
 __pycache__/
 *.py[cod]

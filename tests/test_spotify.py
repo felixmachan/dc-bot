@@ -136,3 +136,62 @@ def test_every_error_code_has_a_message():
     for code in ["no_client", "bad_url", "forbidden", "not_found", "empty", "error"]:
         assert main.spotify_error_message(code).startswith("❌")
     assert main.spotify_error_message("valami_ismeretlen") == main.SPOTIFY_ERROR_MESSAGES["error"]
+
+
+def test_app_only_auth_when_no_redirect_uri(monkeypatch):
+    monkeypatch.setattr(main, "SPOTIFY_REDIRECT_URI", None)
+    assert main.build_spotify_oauth() is None
+
+
+def test_oauth_manager_built_when_configured(monkeypatch):
+    monkeypatch.setattr(main, "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+    monkeypatch.setattr(main, "SPOTIFY_CLIENT_ID", "id")
+    monkeypatch.setattr(main, "SPOTIFY_CLIENT_SECRET", "secret")
+
+    oauth = main.build_spotify_oauth()
+
+    assert oauth is not None
+    assert oauth.redirect_uri == "http://127.0.0.1:8888/callback"
+    assert "playlist-read-private" in oauth.scope
+
+
+def test_client_falls_back_to_app_only_when_no_cached_token(monkeypatch):
+    """A missing token must not stop the bot from starting."""
+    monkeypatch.setattr(main, "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+    monkeypatch.setattr(main, "SPOTIFY_CLIENT_ID", "id")
+    monkeypatch.setattr(main, "SPOTIFY_CLIENT_SECRET", "secret")
+
+    class EmptyCache:
+        def get_cached_token(self):
+            return None
+
+    def fake_oauth():
+        return SimpleNamespace(cache_handler=EmptyCache())
+
+    monkeypatch.setattr(main, "build_spotify_oauth", fake_oauth)
+
+    client = main.create_spotify_client()
+
+    assert client is not None
+    assert isinstance(client.auth_manager, main.SpotifyClientCredentials)
+
+
+def test_client_uses_user_auth_when_a_token_is_cached(monkeypatch):
+    monkeypatch.setattr(main, "SPOTIFY_CLIENT_ID", "id")
+    monkeypatch.setattr(main, "SPOTIFY_CLIENT_SECRET", "secret")
+
+    class FilledCache:
+        def get_cached_token(self):
+            return {"access_token": "x", "refresh_token": "y"}
+
+    sentinel = SimpleNamespace(cache_handler=FilledCache())
+    monkeypatch.setattr(main, "build_spotify_oauth", lambda: sentinel)
+
+    client = main.create_spotify_client()
+
+    assert client.auth_manager is sentinel, "the user auth manager must win"
+
+
+def test_no_client_without_credentials(monkeypatch):
+    monkeypatch.setattr(main, "SPOTIFY_CLIENT_ID", None)
+    assert main.create_spotify_client() is None
