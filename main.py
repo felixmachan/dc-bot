@@ -912,6 +912,14 @@ async def send_player_message(guild: discord.Guild, track: QueuedTrack) -> None:
     message = await safe_send(track.target, embed=embed, view=PlayerView())
     if message:
         player_messages[guild.id] = message
+        return
+
+    # Sending the panel needs the Embed Links permission; without it the announcement
+    # would vanish entirely, which is worse than the plain line it replaced.
+    logger.warning(
+        "Player panel could not be sent guild_id=%s; falling back to plain text", guild.id
+    )
+    await safe_send(track.target, f"🎶 Most játszom: **{track.title}**")
 
 
 async def retire_player_message(guild_id: int) -> None:

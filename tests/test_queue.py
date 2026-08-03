@@ -124,6 +124,39 @@ def test_queued_titles_does_not_consume_the_queue():
     assert queue.qsize() == 2
 
 
+def test_player_panel_falls_back_to_plain_text_when_the_embed_cannot_be_sent(monkeypatch):
+    """Without the Embed Links permission the announcement must still get through."""
+    guild = FakeGuild(705)
+    calls = []
+
+    async def refusing_safe_send(target, message=None, *, embed=None, view=None):
+        calls.append({"message": message, "embed": embed})
+        return None if embed is not None else "sent"
+
+    monkeypatch.setattr(main, "safe_send", refusing_safe_send)
+
+    track = main.QueuedTrack(source="x", title="Valami szám", target=None)
+    asyncio.run(main.send_player_message(guild, track))
+
+    assert calls[0]["embed"] is not None, "the embed panel is attempted first"
+    assert len(calls) == 2, "a plain text fallback must follow the failed embed"
+    assert "Valami szám" in calls[1]["message"]
+    assert guild.id not in main.player_messages
+
+
+def test_player_panel_is_remembered_when_it_sends(monkeypatch):
+    guild = FakeGuild(706)
+
+    async def ok_safe_send(target, message=None, *, embed=None, view=None):
+        return "the-message"
+
+    monkeypatch.setattr(main, "safe_send", ok_safe_send)
+
+    asyncio.run(main.send_player_message(guild, main.QueuedTrack(source="x", title="t", target=None)))
+
+    assert main.player_messages[guild.id] == "the-message"
+
+
 def test_clear_queue_empties_it():
     queue = main.get_guild_queue(704)
     for i in range(3):
