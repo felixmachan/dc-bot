@@ -165,9 +165,11 @@ autocomplete_cache: dict[str, Tuple[float, List[str]]] = {}
 AUTOCOMPLETE_CACHE_TTL_SECONDS = 30.0
 autocomplete_inflight: dict[str, asyncio.Task] = {}
 intentional_voice_disconnect_until: dict[int, float] = {}
+idle_disconnect_tasks: dict[int, asyncio.Task] = {}
 VOICE_CONNECT_TIMEOUT_CODE = "VOICE_CONNECT_TIMEOUT"
 VOICE_CONNECT_UNSTABLE_CODE = "VOICE_CONNECT_UNSTABLE"
 VOICE_INTENTIONAL_DISCONNECT_GRACE_SEC = 15.0
+IDLE_DISCONNECT_DELAY_SEC = 300.0
 
 
 def find_ffmpeg_executable() -> Optional[str]:
@@ -1352,11 +1354,47 @@ class TrackChooserView(discord.ui.View):
 
 async def enqueue_track(guild: discord.Guild, track: QueuedTrack) -> None:
     """Add a track to the guild queue and start playback if nothing is running."""
+    cancel_idle_disconnect(guild.id)
     queue = get_guild_queue(guild.id)
     await queue.put(track)
     vc = guild.voice_client
     if vc and not vc.is_playing() and not vc.is_paused():
         await play_next(guild)
+
+
+def cancel_idle_disconnect(guild_id: int) -> None:
+    """Cancel the delayed voice disconnect when new work arrives."""
+    task = idle_disconnect_tasks.pop(guild_id, None)
+    if task and not task.done():
+        task.cancel()
+    intentional_voice_disconnect_until.pop(guild_id, None)
+
+
+async def disconnect_after_idle(guild: discord.Guild) -> None:
+    """Leave an otherwise empty voice channel after a short idle grace period."""
+    try:
+        await asyncio.sleep(IDLE_DISCONNECT_DELAY_SEC)
+        queue = get_guild_queue(guild.id)
+        vc = guild.voice_client
+        if not queue.empty() or guild.id in current_track or not vc:
+            return
+        mark_intentional_voice_disconnect(guild.id)
+        if vc.is_connected() or vc.is_playing() or vc.is_paused():
+            await vc.disconnect(force=True)
+        logger.info("VOICE_EVENT phase=idle_disconnect guild_id=%s delay_seconds=%s", guild.id, IDLE_DISCONNECT_DELAY_SEC)
+    except asyncio.CancelledError:
+        return
+    finally:
+        idle_disconnect_tasks.pop(guild.id, None)
+
+
+def schedule_idle_disconnect(guild: discord.Guild) -> None:
+    """Schedule, but do not immediately perform, an idle voice disconnect."""
+    existing = idle_disconnect_tasks.get(guild.id)
+    if existing and not existing.done():
+        return
+    idle_disconnect_tasks[guild.id] = bot.loop.create_task(disconnect_after_idle(guild))
+    logger.info("VOICE_EVENT phase=idle_disconnect_scheduled guild_id=%s delay_seconds=%s", guild.id, IDLE_DISCONNECT_DELAY_SEC)
 
 
 async def send_track_chooser(
@@ -1677,8 +1715,7 @@ async def play_next(guild: discord.Guild):
         if queue.empty():
             vc = guild.voice_client
             if vc and (vc.is_connected() or vc.is_playing() or vc.is_paused()):
-                mark_intentional_voice_disconnect(guild.id)
-                await vc.disconnect(force=True)
+                schedule_idle_disconnect(guild)
             current_track.pop(guild.id, None)
             now_playing.pop(guild.id, None)
             track_recovery_attempts.pop(guild.id, None)
@@ -1695,11 +1732,10 @@ async def play_next(guild: discord.Guild):
         try:
             track = queue.get_nowait()
         except asyncio.QueueEmpty:
-            mark_intentional_voice_disconnect(guild.id)
+            schedule_idle_disconnect(guild)
             current_track.pop(guild.id, None)
             now_playing.pop(guild.id, None)
             track_recovery_attempts.pop(guild.id, None)
-            await vc.disconnect(force=True)
             return
         ok = await start_track(guild, track)
         if not ok:
@@ -2063,6 +2099,3 @@ def run_bot() -> None:
 
 if __name__ == "__main__":
     run_bot()
-
-
-
