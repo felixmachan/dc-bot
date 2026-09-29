@@ -766,7 +766,9 @@ async def resolve_stream_url(candidates: List[SearchResult]) -> Optional[Tuple[s
         return None
 
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[acodec!=none]/best',
+        # Plain `bestaudio` lets yt-dlp pick by bitrate, which on YouTube is the
+        # ~160k Opus stream; pinning m4a first capped every track at 128k AAC.
+        'format': 'bestaudio[acodec!=none]/bestaudio/best',
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
@@ -817,7 +819,9 @@ async def resolve_stream_url(candidates: List[SearchResult]) -> Optional[Tuple[s
                 last_error = "no audio-only format"
                 logger.warning("no usable audio format url=%r", watch_url)
                 continue
-            audio_formats.sort(key=lambda f: f.get('abr') or f.get('asr') or 0, reverse=True)
+            # Sort on bitrate only: falling back to asr mixed units, so a format
+            # with no abr (asr 48000) outranked a real 160k stream.
+            audio_formats.sort(key=lambda f: f.get('abr') or 0, reverse=True)
             audio_url = audio_formats[0]['url']
 
         return audio_url, entry.get('title') or candidate.title
@@ -1462,6 +1466,52 @@ def clear_queue(guild_id: int) -> None:
             break
 
 
+FFMPEG_BEFORE_OPTIONS = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 "
+    "-reconnect_on_network_error 1 -reconnect_delay_max 5 -nostdin "
+    # Without a sizeable input queue ffmpeg stalls the reader on every network
+    # hiccup, which is what the listeners hear as a short freeze.
+    "-thread_queue_size 1024 -rw_timeout 15000000"
+)
+
+
+def build_audio_source(stream_url: str, vc: discord.VoiceClient) -> Optional[discord.AudioSource]:
+    """Build the ffmpeg source, letting ffmpeg do the Opus encoding when it can.
+
+    FFmpegOpusAudio hands Discord ready-made Opus packets, so the bot process no
+    longer re-encodes every frame itself -- that per-frame CPU spike is what made
+    playback hitch. It also encodes at the channel's own bitrate instead of the
+    library default, which is where the boxy sound came from.
+    """
+    bitrate = 128
+    channel = getattr(vc, "channel", None)
+    if channel is not None and getattr(channel, "bitrate", None):
+        bitrate = max(64, min(int(channel.bitrate / 1000), 510))
+
+    try:
+        return discord.FFmpegOpusAudio(
+            stream_url,
+            executable=FFMPEG_EXE,
+            bitrate=bitrate,
+            before_options=FFMPEG_BEFORE_OPTIONS,
+            options="-vn -loglevel panic",
+        )
+    except Exception as opus_err:
+        # An ffmpeg build without libopus: fall back to PCM rather than go silent.
+        logger.warning("Opus source failed, PCM fallback error=%s", opus_err)
+
+    try:
+        return discord.FFmpegPCMAudio(
+            stream_url,
+            executable=FFMPEG_EXE,
+            before_options=FFMPEG_BEFORE_OPTIONS,
+            options="-vn -loglevel panic",
+        )
+    except Exception as pcm_err:
+        logger.error("Audio source keszitese sikertelen error=%s", pcm_err)
+        return None
+
+
 async def start_track(guild: discord.Guild, track: QueuedTrack, announce: bool = True) -> bool:
     """Resolve a fresh media URL and start playing one track."""
     vc = await ensure_voice_connection(guild, track.target)
@@ -1479,22 +1529,22 @@ async def start_track(guild: discord.Guild, track: QueuedTrack, announce: bool =
     stream_url, resolved_title = resolved
     track.title = resolved_title
 
-    source = discord.FFmpegPCMAudio(
-        stream_url,
-        executable=FFMPEG_EXE,
-        before_options=(
-            "-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 "
-            "-reconnect_on_network_error 1 -reconnect_delay_max 5 -nostdin"
-        ),
-        options="-vn -loglevel panic"
-    )
+    source = build_audio_source(stream_url, vc)
+    if not source:
+        return False
 
     def after(error):
         fut = asyncio.run_coroutine_threadsafe(handle_track_end(guild, error), bot.loop)
-        try:
-            fut.result()
-        except Exception as exc:
-            logger.error("Track end callback hiba error=%s", exc)
+
+        def log_result(done):
+            try:
+                done.result()
+            except Exception as exc:
+                logger.error("Track end callback hiba error=%s", exc)
+
+        # Waiting on the future here would pin the player thread for the whole
+        # next-track resolve, so only the logging is deferred to the callback.
+        fut.add_done_callback(log_result)
 
     try:
         vc.play(source, after=after)

@@ -37,6 +37,7 @@ def isolated_state(monkeypatch):
     monkeypatch.setattr(main, "current_track", {})
     monkeypatch.setattr(main, "now_playing", {})
     monkeypatch.setattr(main, "player_messages", {})
+    monkeypatch.setattr(main, "idle_disconnect_tasks", {})
 
     scheduled = []
 
@@ -103,14 +104,17 @@ def test_successful_track_is_not_requeued(monkeypatch):
     assert queue.empty()
 
 
-def test_empty_queue_disconnects_and_clears_state(monkeypatch):
+def test_empty_queue_clears_state_and_only_schedules_the_disconnect(isolated_state):
+    """An empty queue must not drop the connection: the bot stays for the grace period."""
     guild = FakeGuild(702)
     main.current_track[guild.id] = main.QueuedTrack(source="x", title="x", target=None)
     main.now_playing[guild.id] = "x"
 
     asyncio.run(main.play_next(guild))
 
-    assert guild.voice_client.disconnect_called
+    assert not guild.voice_client.disconnect_called
+    assert len(isolated_state) == 1
+    assert guild.id in main.idle_disconnect_tasks
     assert guild.id not in main.current_track
     assert guild.id not in main.now_playing
 
