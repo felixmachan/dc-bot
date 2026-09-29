@@ -6,6 +6,7 @@ import glob
 import shutil
 import time
 import logging
+import threading
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
@@ -82,12 +83,44 @@ YTDLP_PLAYER_CLIENTS = [
     if client.strip()
 ]
 
+# Per-track playback timing and ffmpeg warnings in the log (AUDIO_DIAG lines).
+# On by default: it costs a few counters per 20 ms frame and one line per window.
+AUDIO_DIAGNOSTICS = os.getenv("AUDIO_DIAGNOSTICS", "1").strip().lower() not in {"0", "false", "no", "off"}
+AUDIO_DIAG_WINDOW_SEC = 15.0
+
 LOG_LEVEL = parse_log_level()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("dc_bot")
+
+# yt-dlp is pure Python and holds the GIL while it parses, so concurrent jobs can
+# starve the audio player thread. Counted here so AUDIO_DIAG can show the overlap.
+_ytdlp_lock = threading.Lock()
+_ytdlp_active = 0
+_ytdlp_peak = 0
+
+
+def run_ytdlp_job(fn, *args):
+    """Run a blocking yt-dlp call (inside to_thread) while counting concurrent jobs."""
+    global _ytdlp_active, _ytdlp_peak
+    with _ytdlp_lock:
+        _ytdlp_active += 1
+        _ytdlp_peak = max(_ytdlp_peak, _ytdlp_active)
+    try:
+        return fn(*args)
+    finally:
+        with _ytdlp_lock:
+            _ytdlp_active -= 1
+
+
+def take_ytdlp_peak() -> int:
+    """Return the most concurrent yt-dlp jobs since the last call, and reset it."""
+    global _ytdlp_peak
+    with _ytdlp_lock:
+        peak, _ytdlp_peak = _ytdlp_peak, _ytdlp_active
+    return peak
 
 # Spotify credentials (optional)
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
@@ -462,7 +495,7 @@ async def get_youtube_playlist(
             return ydl.extract_info(url, download=False)
 
     try:
-        info = await asyncio.wait_for(asyncio.to_thread(_extract), timeout=SEARCH_TIMEOUT_SEC)
+        info = await asyncio.wait_for(asyncio.to_thread(run_ytdlp_job, _extract), timeout=SEARCH_TIMEOUT_SEC)
     except asyncio.TimeoutError:
         logger.warning("YouTube playlist timeout url=%r", url)
         return [], "timeout"
@@ -619,7 +652,7 @@ async def yt_autocomplete(
     async def _populate_cache() -> None:
         try:
             # Populate cache in the background so autocomplete response stays immediate.
-            titles = await asyncio.wait_for(asyncio.to_thread(_fetch_titles), timeout=4.0)
+            titles = await asyncio.wait_for(asyncio.to_thread(run_ytdlp_job, _fetch_titles), timeout=4.0)
             autocomplete_cache[cache_key] = (time.monotonic(), titles)
         except Exception:
             pass
@@ -686,7 +719,7 @@ async def _search_once(
             return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
 
     try:
-        info = await asyncio.wait_for(asyncio.to_thread(_search), timeout=SEARCH_TIMEOUT_SEC)
+        info = await asyncio.wait_for(asyncio.to_thread(run_ytdlp_job, _search), timeout=SEARCH_TIMEOUT_SEC)
     except asyncio.TimeoutError:
         logger.warning("yt-dlp search timeout term=%r timeout=%ds", query, SEARCH_TIMEOUT_SEC)
         return None
@@ -756,6 +789,21 @@ async def search_youtube(term: str, limit: int = SEARCH_CANDIDATES) -> List["Sea
     return candidates
 
 
+# What yt-dlp actually picked for each resolved media URL, read back once at
+# playback start: the codec decides whether ffmpeg can pass Opus through.
+resolved_stream_formats: dict[str, dict] = {}
+
+
+def remember_stream_format(stream_url: str, fmt: dict) -> None:
+    """Keep the few format fields playback and diagnostics care about."""
+    if len(resolved_stream_formats) > 50:
+        resolved_stream_formats.clear()
+    resolved_stream_formats[stream_url] = {
+        key: fmt.get(key)
+        for key in ("format_id", "acodec", "vcodec", "abr", "asr", "ext", "protocol")
+    }
+
+
 async def resolve_stream_url(candidates: List[SearchResult]) -> Optional[Tuple[str, str]]:
     """Resolve the first playable candidate to a fresh (stream_url, title).
 
@@ -789,7 +837,7 @@ async def resolve_stream_url(candidates: List[SearchResult]) -> Optional[Tuple[s
         watch_url = candidate.url
         try:
             info = await asyncio.wait_for(
-                asyncio.to_thread(_extract, watch_url), timeout=SEARCH_TIMEOUT_SEC
+                asyncio.to_thread(run_ytdlp_job, _extract, watch_url), timeout=SEARCH_TIMEOUT_SEC
             )
         except asyncio.TimeoutError:
             last_error = "timeout"
@@ -807,6 +855,7 @@ async def resolve_stream_url(candidates: List[SearchResult]) -> Optional[Tuple[s
             continue
 
         audio_url = entry.get('url')
+        chosen_format: dict = entry
         if not audio_url:
             audio_formats = [
                 f for f in entry.get('formats', [])
@@ -822,8 +871,10 @@ async def resolve_stream_url(candidates: List[SearchResult]) -> Optional[Tuple[s
             # Sort on bitrate only: falling back to asr mixed units, so a format
             # with no abr (asr 48000) outranked a real 160k stream.
             audio_formats.sort(key=lambda f: f.get('abr') or 0, reverse=True)
-            audio_url = audio_formats[0]['url']
+            chosen_format = audio_formats[0]
+            audio_url = chosen_format['url']
 
+        remember_stream_format(audio_url, chosen_format)
         return audio_url, entry.get('title') or candidate.title
 
     logger.error(
@@ -945,8 +996,29 @@ async def get_spotify_tracks(url: str) -> Tuple[List[str], Optional[str]]:
     return result, None if result else "empty"
 
 
+loop_lag_monitor_task: Optional[asyncio.Task] = None
+
+
+async def monitor_loop_lag(interval: float = 0.25, threshold: float = 0.15) -> None:
+    """Warn whenever the event loop wakes up late.
+
+    Audio packets go out from their own thread, but anything that blocks the
+    event loop (or hogs the GIL) shows up here, so its timestamps can be matched
+    against the AUDIO_DIAG late_gaps.
+    """
+    while True:
+        started = time.perf_counter()
+        await asyncio.sleep(interval)
+        lag = time.perf_counter() - started - interval
+        if lag > threshold:
+            logger.warning("LOOP_LAG ms=%.0f ytdlp_jobs_active=%d", lag * 1000, _ytdlp_active)
+
+
 @bot.event
 async def on_ready():
+    global loop_lag_monitor_task
+    if AUDIO_DIAGNOSTICS and (loop_lag_monitor_task is None or loop_lag_monitor_task.done()):
+        loop_lag_monitor_task = asyncio.create_task(monitor_loop_lag())
     logger.info("Bot elindult user=%s", bot.user)
     # Register the control panel once so buttons on messages from a previous
     # process keep working after a restart.
@@ -1475,13 +1547,179 @@ FFMPEG_BEFORE_OPTIONS = (
 )
 
 
-def build_audio_source(stream_url: str, vc: discord.VoiceClient) -> Optional[discord.AudioSource]:
-    """Build the ffmpeg source, letting ffmpeg do the Opus encoding when it can.
+class FfmpegLogSink:
+    """Where discord.py pipes ffmpeg's stderr: each line becomes a log record.
 
-    FFmpegOpusAudio hands Discord ready-made Opus packets, so the bot process no
-    longer re-encodes every frame itself -- that per-frame CPU spike is what made
-    playback hitch.
+    Deliberately has no fileno(), which is what makes discord.py pipe stderr
+    through its reader thread into write() instead of handing it the raw fd.
     """
+
+    def __init__(self, guild_id: int):
+        self.guild_id = guild_id
+        self._buffer = b""
+
+    def write(self, data: bytes) -> None:
+        self._buffer += data
+        *lines, self._buffer = self._buffer.split(b"\n")
+        for raw in lines:
+            line = raw.decode(errors="replace").strip()
+            if line:
+                logger.warning("FFMPEG guild_id=%s %s", self.guild_id, line)
+
+
+def read_pressure(kind: str) -> str:
+    """The 10 s 'some' stall share from /proc/pressure, or '-' where unsupported."""
+    try:
+        with open(f"/proc/pressure/{kind}") as fh:
+            first = fh.readline().split()
+        return next(part.split("=", 1)[1] for part in first if part.startswith("avg10="))
+    except Exception:
+        return "-"
+
+
+class DiagnosticSource(discord.AudioSource):
+    """Wraps the ffmpeg source and times every 20 ms frame the player thread pulls.
+
+    It separates the two ways playback can hitch, which sound the same:
+      * slow_reads: read() itself blocked -- ffmpeg had no packet ready, so the
+        input side (YouTube, network, ffmpeg) is behind.
+      * late_gaps: too long between one read ending and the next starting -- the
+        player thread was not scheduled in time (CPU, GIL, host), or the UDP send
+        blocked.
+    Either one is followed by catch-up bursts, which Discord's jitter buffer drops.
+    """
+
+    FRAME_SEC = 0.02
+    SLOW_READ_SEC = 0.015
+    LATE_GAP_SEC = 0.030
+    BURST_SEC = 0.005
+    PAUSE_SEC = 1.0
+    # ffmpeg is still filling its buffer right after the first packet, so the
+    # first second always has a slow read and a catch-up burst. Not a hitch.
+    STARTUP_GRACE_SEC = 1.0
+
+    def __init__(self, inner: discord.AudioSource, guild_id: int, vc: discord.VoiceClient, label: str):
+        self.inner = inner
+        self.guild_id = guild_id
+        self.vc = vc
+        self.label = label
+        self.total_frames = 0
+        self.first_read_ms: Optional[float] = None
+        self._cleaned_up = False
+        self._first_frame_at: Optional[float] = None
+        self._last_read_end: Optional[float] = None
+        self._window_start: Optional[float] = None
+        self._cpu_start = time.process_time()
+        self._reset_window(time.perf_counter())
+
+    def _reset_window(self, now: float) -> None:
+        self._window_start = now
+        self._cpu_start = time.process_time()
+        self._paused_sec = 0.0
+        self.frames = 0
+        self.slow_reads = 0
+        self.read_max = 0.0
+        self.late_gaps = 0
+        self.gap_max = 0.0
+        self.bursts = 0
+
+    def is_opus(self) -> bool:
+        return self.inner.is_opus()
+
+    def read(self) -> bytes:
+        start = time.perf_counter()
+        warming_up = self._first_frame_at is None or start - self._first_frame_at < self.STARTUP_GRACE_SEC
+        if self._last_read_end is not None and not warming_up:
+            idle = start - self._last_read_end
+            if idle >= self.PAUSE_SEC:
+                # Paused (or reconnecting): not a hitch, and not playing time either.
+                self._paused_sec += idle
+            else:
+                self.gap_max = max(self.gap_max, idle)
+                if idle > self.LATE_GAP_SEC:
+                    self.late_gaps += 1
+                elif idle < self.BURST_SEC:
+                    self.bursts += 1
+
+        data = self.inner.read()
+        end = time.perf_counter()
+        took = end - start
+        if self.first_read_ms is None:
+            # The first read waits for ffmpeg to connect and buffer; report it apart.
+            self.first_read_ms = took * 1000
+            self._first_frame_at = end
+        elif not warming_up:
+            self.read_max = max(self.read_max, took)
+            if took > self.SLOW_READ_SEC:
+                self.slow_reads += 1
+        self._last_read_end = end
+
+        if data:
+            self.frames += 1
+            self.total_frames += 1
+        if end - self._window_start >= AUDIO_DIAG_WINDOW_SEC:
+            self.report(end)
+        return data
+
+    def report(self, now: Optional[float] = None, final: bool = False) -> None:
+        now = now or time.perf_counter()
+        elapsed = now - self._window_start
+        playing = max(elapsed - self._paused_sec, 0.001)
+        behind_ms = max(0.0, playing / self.FRAME_SEC - self.frames) * self.FRAME_SEC * 1000
+        cpu_pct = (time.process_time() - self._cpu_start) / elapsed * 100 if elapsed > 0 else 0.0
+        ws_ms = (getattr(self.vc, "latency", float("nan")) or float("nan")) * 1000
+        ytdlp_peak = take_ytdlp_peak()
+
+        if self.slow_reads:
+            verdict = "input_stall"
+        elif self.late_gaps:
+            verdict = "player_starved"
+        elif behind_ms > 200:
+            verdict = "drifting"
+        else:
+            verdict = "ok"
+        level = logging.INFO if verdict == "ok" else logging.WARNING
+        logger.log(
+            level,
+            "AUDIO_DIAG guild_id=%s%s verdict=%s window_s=%.1f frames=%d behind_ms=%.0f "
+            "slow_reads=%d read_max_ms=%.0f late_gaps=%d gap_max_ms=%.0f bursts=%d "
+            "bot_cpu_pct=%.0f ytdlp_jobs_peak=%d psi_cpu=%s psi_io=%s voice_ws_ms=%.0f %s",
+            self.guild_id, " final" if final else "", verdict, elapsed, self.frames, behind_ms,
+            self.slow_reads, self.read_max * 1000, self.late_gaps, self.gap_max * 1000, self.bursts,
+            cpu_pct, ytdlp_peak, read_pressure("cpu"), read_pressure("io"), ws_ms, self.label,
+        )
+        self._reset_window(now)
+
+    def cleanup(self) -> None:
+        # AudioSource.__del__ calls cleanup() again after the player already did.
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        if self.frames:
+            self.report(final=True)
+        logger.info(
+            "AUDIO_DIAG guild_id=%s track_end frames=%d played_s=%.0f first_read_ms=%.0f",
+            self.guild_id, self.total_frames, self.total_frames * self.FRAME_SEC, self.first_read_ms or -1,
+        )
+        self.inner.cleanup()
+
+
+def build_audio_source(
+    stream_url: str,
+    vc: discord.VoiceClient,
+    fmt: Optional[dict] = None,
+    guild_id: int = 0,
+) -> Optional[discord.AudioSource]:
+    """Build the ffmpeg source, avoiding any Opus re-encode when the input allows.
+
+    YouTube's audio-only streams (itag 251/250/249) are already 48 kHz Opus in
+    20 ms packets, exactly what Discord wants, so ffmpeg just remuxes them
+    (codec='copy'): no generation loss and next to no CPU. Anything else is
+    encoded once by ffmpeg, never by the bot process.
+    """
+    fmt = fmt or {}
+    passthrough = str(fmt.get("acodec") or "").startswith("opus") and fmt.get("asr") in (48000, None)
+
     # 128k is the floor: a fresh voice channel defaults to 64k, which is tuned for
     # speech and makes music sound boxy. Boosted channels may go higher.
     bitrate = 128
@@ -1489,28 +1727,54 @@ def build_audio_source(stream_url: str, vc: discord.VoiceClient) -> Optional[dis
     if channel is not None and getattr(channel, "bitrate", None):
         bitrate = max(128, min(int(channel.bitrate / 1000), 510))
 
+    loglevel = "warning" if AUDIO_DIAGNOSTICS else "panic"
+    extra = {"stderr": FfmpegLogSink(guild_id)} if AUDIO_DIAGNOSTICS else {}
+    options = f"-vn -loglevel {loglevel}"
+
+    source: Optional[discord.AudioSource] = None
+    mode = ""
     try:
-        return discord.FFmpegOpusAudio(
+        source = discord.FFmpegOpusAudio(
             stream_url,
             executable=FFMPEG_EXE,
             bitrate=bitrate,
+            codec="copy" if passthrough else None,
             before_options=FFMPEG_BEFORE_OPTIONS,
-            options="-vn -loglevel panic",
+            options=options,
+            **extra,
         )
+        mode = "opus_copy" if passthrough else f"opus_encode_{bitrate}k"
     except Exception as opus_err:
         # An ffmpeg build without libopus: fall back to PCM rather than go silent.
         logger.warning("Opus source failed, PCM fallback error=%s", opus_err)
 
-    try:
-        return discord.FFmpegPCMAudio(
-            stream_url,
-            executable=FFMPEG_EXE,
-            before_options=FFMPEG_BEFORE_OPTIONS,
-            options="-vn -loglevel panic",
-        )
-    except Exception as pcm_err:
-        logger.error("Audio source keszitese sikertelen error=%s", pcm_err)
-        return None
+    if source is None:
+        try:
+            source = discord.FFmpegPCMAudio(
+                stream_url,
+                executable=FFMPEG_EXE,
+                before_options=FFMPEG_BEFORE_OPTIONS,
+                options=options,
+                **extra,
+            )
+            mode = "pcm_fallback"
+        except Exception as pcm_err:
+            logger.error("Audio source keszitese sikertelen error=%s", pcm_err)
+            return None
+
+    channel_kbps = int(channel.bitrate / 1000) if channel is not None and getattr(channel, "bitrate", None) else -1
+    label = (
+        f"mode={mode} itag={fmt.get('format_id')} acodec={fmt.get('acodec')} "
+        f"abr={fmt.get('abr')} asr={fmt.get('asr')} protocol={fmt.get('protocol')} channel_kbps={channel_kbps}"
+    )
+    logger.info("AUDIO_TRACK guild_id=%s %s", guild_id, label)
+    if fmt.get("vcodec") not in (None, "none"):
+        # The muxed video fallback (itag 18) is what made music sound boxy before.
+        logger.warning("AUDIO_TRACK guild_id=%s got a video+audio stream, not audio-only: %s", guild_id, label)
+
+    if AUDIO_DIAGNOSTICS:
+        return DiagnosticSource(source, guild_id, vc, label)
+    return source
 
 
 async def start_track(guild: discord.Guild, track: QueuedTrack, announce: bool = True) -> bool:
@@ -1530,7 +1794,9 @@ async def start_track(guild: discord.Guild, track: QueuedTrack, announce: bool =
     stream_url, resolved_title = resolved
     track.title = resolved_title
 
-    source = build_audio_source(stream_url, vc)
+    source = build_audio_source(
+        stream_url, vc, resolved_stream_formats.pop(stream_url, None), guild.id
+    )
     if not source:
         return False
 
