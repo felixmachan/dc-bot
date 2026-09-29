@@ -1,4 +1,4 @@
 discord.py[voice]==2.7.1
 python-dotenv==1.1.1
-yt-dlp==2026.3.3
+yt-dlp==2026.8.19
 spotipy==2.23.0

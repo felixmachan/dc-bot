@@ -1480,13 +1480,14 @@ def build_audio_source(stream_url: str, vc: discord.VoiceClient) -> Optional[dis
 
     FFmpegOpusAudio hands Discord ready-made Opus packets, so the bot process no
     longer re-encodes every frame itself -- that per-frame CPU spike is what made
-    playback hitch. It also encodes at the channel's own bitrate instead of the
-    library default, which is where the boxy sound came from.
+    playback hitch.
     """
+    # 128k is the floor: a fresh voice channel defaults to 64k, which is tuned for
+    # speech and makes music sound boxy. Boosted channels may go higher.
     bitrate = 128
     channel = getattr(vc, "channel", None)
     if channel is not None and getattr(channel, "bitrate", None):
-        bitrate = max(64, min(int(channel.bitrate / 1000), 510))
+        bitrate = max(128, min(int(channel.bitrate / 1000), 510))
 
     try:
         return discord.FFmpegOpusAudio(
